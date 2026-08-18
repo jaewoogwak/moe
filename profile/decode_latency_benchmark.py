@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import sys
 import time
 from collections import defaultdict
@@ -12,7 +13,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from statistics import mean, pstdev
-from typing import Iterator
+from typing import Callable, Iterator, TextIO
 
 import torch
 from tqdm import tqdm
@@ -130,6 +131,8 @@ class TokenProfiler:
         expert_compute_ms = elapsed("expert_compute")
         h2d_bytes = cache_after.h2d_bytes - self._cache_before.h2d_bytes
         host_staging_ms = cache_after.host_staging_ms - self._cache_before.host_staging_ms
+        # These five values form the additive TPOT breakdown. Host staging is
+        # recorded separately because it is not an additive GPU-latency term.
         component_sum = attention_ms + router_ms + h2d_ms + expert_compute_ms
         misses = cache_after.misses - self._cache_before.misses
         hits = cache_after.hits - self._cache_before.hits
@@ -462,13 +465,31 @@ class DecodeBenchmark:
         return results
 
 
+def _atomic_write(path: Path, write: Callable[[TextIO], None]) -> None:
+    """Replace a completed result file without corrupting the prior checkpoint."""
+    temporary_path = path.with_name(f".{path.name}.tmp")
+    try:
+        with temporary_path.open("w", newline="") as handle:
+            write(handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+
 def _write_json_csv(rows: list[dict[str, object]], json_path: Path, csv_path: Path) -> None:
-    with json_path.open("w") as handle:
+    def write_json(handle: object) -> None:
         json.dump(rows, handle, indent=2)
-    with csv_path.open("w", newline="") as handle:
+
+    def write_csv(handle: object) -> None:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
         writer.writeheader()
         writer.writerows(rows)
+
+    _atomic_write(json_path, write_json)
+    _atomic_write(csv_path, write_csv)
 
 
 def save_results(results: list[TokenResult], output_dir: Path, metadata: dict[str, object]) -> None:
@@ -480,8 +501,6 @@ def save_results(results: list[TokenResult], output_dir: Path, metadata: dict[st
         output_dir / "decode_tokens.json",
         output_dir / "decode_tokens.csv",
     )
-    with (output_dir / "decode_metadata.json").open("w") as handle:
-        json.dump(metadata, handle, indent=2)
 
     grouped: dict[tuple[str, int], list[TokenResult]] = defaultdict(list)
     for row in results:
@@ -528,6 +547,7 @@ def save_results(results: list[TokenResult], output_dir: Path, metadata: dict[st
         summary["hit_rate_std"] = pstdev(hit_rates)
         summaries.append(summary)
     _write_json_csv(summaries, output_dir / "decode_summary.json", output_dir / "decode_summary.csv")
+    _atomic_write(output_dir / "decode_metadata.json", lambda handle: json.dump(metadata, handle, indent=2))
 
     print()
     print(
@@ -593,6 +613,17 @@ def main() -> None:
 
     benchmark = DecodeBenchmark(args.model, args.gpu_budget_gib, args.runtime_reserve_gib)
     all_results: list[TokenResult] = []
+    metadata: dict[str, object] = {
+        "model": args.model,
+        "dataset": DATASET_NAME,
+        "sample_seed": args.sample_seed,
+        "sample_ids": [sample.sample_id for sample in samples],
+        "contexts": args.contexts,
+        "warmup_tokens": args.warmup_tokens,
+        "measure_tokens": args.measure_tokens,
+        "sample_selection_prompt_length": selection_prompt_length,
+        "completed_runs": [],
+    }
     for sample in samples:
         for context_length in args.contexts:
             prefill_length = context_length - args.measure_tokens - args.warmup_tokens
@@ -605,27 +636,20 @@ def main() -> None:
                     f"input_ids length {prompt_input_ids.shape[-1]} does not equal {prefill_length}"
                 )
             print(f"Running sample {sample.sample_id}, context length {context_length}")
-            all_results.extend(
-                benchmark.run_context(
-                    sample.sample_id,
-                    context_length,
-                    args.warmup_tokens,
-                    args.measure_tokens,
-                    prompt_input_ids,
-                    not args.no_progress,
-                )
+            context_results = benchmark.run_context(
+                sample.sample_id,
+                context_length,
+                args.warmup_tokens,
+                args.measure_tokens,
+                prompt_input_ids,
+                not args.no_progress,
             )
-    metadata = {
-        "model": args.model,
-        "dataset": DATASET_NAME,
-        "sample_seed": args.sample_seed,
-        "sample_ids": [sample.sample_id for sample in samples],
-        "contexts": args.contexts,
-        "warmup_tokens": args.warmup_tokens,
-        "measure_tokens": args.measure_tokens,
-        "sample_selection_prompt_length": selection_prompt_length,
-    }
-    save_results(all_results, args.output_dir, metadata)
+            all_results.extend(context_results)
+            completed_runs = metadata["completed_runs"]
+            assert isinstance(completed_runs, list)
+            completed_runs.append({"sample_id": sample.sample_id, "context_length": context_length})
+            save_results(all_results, args.output_dir, metadata)
+            print(f"Checkpointed sample {sample.sample_id}, context length {context_length}")
 
 
 if __name__ == "__main__":
