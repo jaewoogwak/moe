@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import math
 import sys
 import time
 from collections import defaultdict
@@ -40,11 +39,13 @@ class TokenResult:
     attention_ms: float
     router_ms: float
     expert_h2d_ms: float
+    host_staging_ms: float
     expert_compute_ms: float
     other_ms: float
     cache_hits: int
     cache_misses: int
     cache_evictions: int
+    expert_accesses: int
     h2d_bytes: int
     kv_cache_bytes: int
     expert_cache_bytes: int
@@ -54,8 +55,9 @@ class TokenResult:
 class TokenProfiler:
     """Collect default-stream CUDA event ranges for one decode forward."""
 
-    def __init__(self, expert_cache: GPUExpertCache) -> None:
+    def __init__(self, expert_cache: GPUExpertCache, expected_expert_accesses: int) -> None:
         self.expert_cache = expert_cache
+        self.expected_expert_accesses = expected_expert_accesses
         self.active = False
         self._events: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = defaultdict(list)
         self._cache_before: ExpertCacheStats | None = None
@@ -112,12 +114,26 @@ class TokenProfiler:
         router_ms = elapsed("router")
         h2d_ms = elapsed("expert_h2d")
         expert_compute_ms = elapsed("expert_compute")
-        component_sum = attention_ms + router_ms + h2d_ms + expert_compute_ms
         h2d_bytes = cache_after.h2d_bytes - self._cache_before.h2d_bytes
+        host_staging_ms = cache_after.host_staging_ms - self._cache_before.host_staging_ms
+        component_sum = attention_ms + router_ms + host_staging_ms + h2d_ms + expert_compute_ms
         misses = cache_after.misses - self._cache_before.misses
+        hits = cache_after.hits - self._cache_before.hits
+        expert_accesses = hits + misses
         if h2d_bytes != misses * self.expert_cache.expert_size_bytes:
             raise AssertionError("cache miss H2D bytes do not match one BF16 expert per miss")
+        if expert_accesses != self.expected_expert_accesses:
+            raise RuntimeError(
+                f"expected {self.expected_expert_accesses} expert accesses for batch-1 decode, "
+                f"observed {expert_accesses}"
+            )
 
+        other_ms = total_ms - component_sum
+        if other_ms < -1.0:
+            print(
+                f"WARNING: latency component sum exceeds total by {-other_ms:.2f} ms "
+                f"at context {context_length}, token {decode_token}"
+            )
         self.active = False
         return TokenResult(
             context_length=context_length,
@@ -126,11 +142,13 @@ class TokenProfiler:
             attention_ms=attention_ms,
             router_ms=router_ms,
             expert_h2d_ms=h2d_ms,
+            host_staging_ms=host_staging_ms,
             expert_compute_ms=expert_compute_ms,
-            other_ms=max(0.0, total_ms - component_sum),
-            cache_hits=cache_after.hits - self._cache_before.hits,
+            other_ms=other_ms,
+            cache_hits=hits,
             cache_misses=misses,
             cache_evictions=cache_after.evictions - self._cache_before.evictions,
+            expert_accesses=expert_accesses,
             h2d_bytes=h2d_bytes,
             kv_cache_bytes=kv_cache_bytes,
             expert_cache_bytes=self.expert_cache.resident_bytes,
@@ -241,11 +259,13 @@ def average_results(results: list[TokenResult]) -> dict[str, float]:
         "attention_ms",
         "router_ms",
         "expert_h2d_ms",
+        "host_staging_ms",
         "expert_compute_ms",
         "other_ms",
         "cache_hits",
         "cache_misses",
         "cache_evictions",
+        "expert_accesses",
         "h2d_bytes",
         "kv_cache_bytes",
         "expert_cache_bytes",
@@ -274,42 +294,61 @@ class DecodeBenchmark:
         replace_with_cached_offloaded_experts(self.model, self.expert_cache)
         validate_placement(self.model, self.host_store)
         self.non_expert_model_bytes = model_gpu_bytes(self.model)
-        self.profiler = TokenProfiler(self.expert_cache)
+        expected_accesses = self.model.config.num_hidden_layers * self.model.config.num_experts_per_tok
+        self.profiler = TokenProfiler(self.expert_cache, expected_expert_accesses=expected_accesses)
         self.hooks = attach_module_timers(self.model, self.profiler)
 
     @torch.inference_mode()
     def run_context(self, context_length: int, warmup_tokens: int, measure_tokens: int) -> list[TokenResult]:
+        max_positions = self.model.config.max_position_embeddings
+        measured_start_kv_length = min(context_length, max_positions - measure_tokens)
+        if measured_start_kv_length < 1:
+            raise ValueError("requested measured-token count leaves no valid prefill length")
+        prefill_length = measured_start_kv_length - warmup_tokens
+        if prefill_length < 1:
+            raise ValueError("warmup_tokens must be smaller than the measured start KV length")
+
+        print(
+            f"Context plan: requested={context_length}, prefill_length={prefill_length}, "
+            f"measured_start_kv_length={measured_start_kv_length}, "
+            f"measured_end_kv_length={measured_start_kv_length + measure_tokens}"
+        )
         self.expert_cache.clear()
         self.expert_cache.set_capacity_slots(1)
         prompt = torch.randint(
             0,
             self.model.config.vocab_size,
-            (1, context_length),
+            (1, prefill_length),
             dtype=torch.long,
             device="cuda",
         )
         cache = DynamicCache(config=self.model.config)
         prefill_output = self.model(input_ids=prompt, past_key_values=cache, use_cache=True, logits_to_keep=1)
-        torch.cuda.synchronize()
-        kv_bytes = kv_cache_bytes(cache)
-        slots = expert_slots_for_context(
-            self.gpu_budget_bytes,
-            self.non_expert_model_bytes,
-            kv_bytes,
-            self.runtime_reserve_bytes,
-            self.expert_cache.expert_size_bytes,
-        )
-        self.expert_cache.clear()
-        self.expert_cache.set_capacity_slots(slots)
 
         next_token = prefill_output.logits[:, -1:].argmax(dim=-1)
         for _ in range(warmup_tokens):
             output = self.model(input_ids=next_token, past_key_values=cache, use_cache=True, logits_to_keep=1)
             next_token = output.logits[:, -1:].argmax(dim=-1)
         torch.cuda.synchronize()
+
+        if cache.get_seq_length() != measured_start_kv_length:
+            raise AssertionError(
+                f"KV length after warmup is {cache.get_seq_length()}, expected {measured_start_kv_length}"
+            )
+        kv_before = kv_cache_bytes(cache)
+        slots = expert_slots_for_context(
+            self.gpu_budget_bytes,
+            self.non_expert_model_bytes,
+            kv_before,
+            self.runtime_reserve_bytes,
+            self.expert_cache.expert_size_bytes,
+        )
+        self.expert_cache.set_capacity_slots(slots)
+        self.expert_cache.clear()
         self.expert_cache.reset_stats()
 
         memory_before = torch.cuda.memory_allocated()
+        resident_cache_before = self.expert_cache.allocated_bytes
         results: list[TokenResult] = []
         for token_index in range(measure_tokens):
             torch.cuda.synchronize()
@@ -321,6 +360,10 @@ class DecodeBenchmark:
             if not torch.isfinite(output.logits).all():
                 raise AssertionError("decode produced NaN or Inf logits")
             next_token = output.logits[:, -1:].argmax(dim=-1)
+            if cache.get_seq_length() > max_positions:
+                raise AssertionError(
+                    f"measured decode exceeded max positions: {cache.get_seq_length()} > {max_positions}"
+                )
             results.append(
                 self.profiler.finish(
                     context_length=context_length,
@@ -331,9 +374,22 @@ class DecodeBenchmark:
             )
 
         memory_after = torch.cuda.memory_allocated()
-        expected_growth = self.expert_cache.resident_bytes + kv_cache_bytes(cache)
-        if memory_after - memory_before > expected_growth + 64 * 1024**2:
-            raise AssertionError("unexpected continuous GPU memory growth during decode")
+        kv_after = kv_cache_bytes(cache)
+        resident_cache_after = self.expert_cache.allocated_bytes
+        expected_growth = (kv_after - kv_before) + (resident_cache_after - resident_cache_before)
+        actual_growth = memory_after - memory_before
+        allocator_tolerance = 128 * 1024**2
+        print(
+            f"GPU memory: before={memory_before:,}, after={memory_after:,}, "
+            f"KV before/after={kv_before:,}/{kv_after:,}, "
+            f"cache before/after={resident_cache_before:,}/{resident_cache_after:,}"
+        )
+        if actual_growth > expected_growth + allocator_tolerance:
+            raise AssertionError(
+                "unexpected GPU memory growth: "
+                f"actual={actual_growth:,}, expected={expected_growth:,}, "
+                f"tolerance={allocator_tolerance:,}"
+            )
         return results
 
 
@@ -363,14 +419,19 @@ def save_results(results: list[TokenResult], output_dir: Path) -> None:
         writer.writerows(summaries)
 
     print()
-    print("Context | KV GiB | Expert Slots | Hit Rate | H2D GB/token | Attention ms | Router ms | H2D ms | Expert Compute ms | Other ms | TPOT ms")
+    print(
+        "Context | KV GiB | Expert Slots | Hit Rate | Accesses/token | H2D GB/token | "
+        "Host Staging ms | Attention ms | Router ms | H2D ms | Expert Compute ms | Other ms | TPOT ms"
+    )
     for row in summaries:
         print(
             f"{int(row['context_length']):7d} | "
             f"{row['kv_cache_bytes'] / 1024**3:6.2f} | "
             f"{row['expert_cache_slots']:12.1f} | "
             f"{row['hit_rate']:8.3f} | "
+            f"{row['expert_accesses']:14.1f} | "
             f"{row['h2d_bytes'] / 1e9:12.3f} | "
+            f"{row['host_staging_ms']:15.2f} | "
             f"{row['attention_ms']:12.2f} | "
             f"{row['router_ms']:9.2f} | "
             f"{row['expert_h2d_ms']:6.2f} | "
