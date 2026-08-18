@@ -42,6 +42,7 @@ SAMPLE_SELECTION_PROMPT_LENGTH = 32768 - DEFAULT_WARMUP_TOKENS - DEFAULT_MEASURE
 class TokenResult:
     sample_id: str
     requested_context_length: int
+    cache_capacity_slots: int
     measured_start_kv_length: int
     measured_end_kv_length: int
     decode_token: int
@@ -62,6 +63,15 @@ class TokenResult:
     expert_cache_resident_bytes: int
     expert_cache_capacity_slots: int
     expert_cache_resident_slots: int
+
+
+@dataclass
+class ContextRun:
+    """One complete warmup and measured decode run at a cache capacity."""
+
+    token_results: list[TokenResult]
+    generated_token_ids: list[int]
+    cache_capacity_slots: int
 
 
 class TokenProfiler:
@@ -112,6 +122,7 @@ class TokenProfiler:
         self,
         sample_id: str,
         requested_context_length: int,
+        cache_capacity_slots: int,
         measured_start_kv_length: int,
         measured_end_kv_length: int,
         decode_token: int,
@@ -154,6 +165,11 @@ class TokenProfiler:
             raise AssertionError("expert-cache resident bytes do not match its occupied slots")
         if self.expert_cache.resident_slots > self.expert_cache.capacity_slots:
             raise AssertionError("expert-cache residency exceeds its slot capacity")
+        if self.expert_cache.capacity_slots != cache_capacity_slots:
+            raise AssertionError(
+                f"requested cache capacity {cache_capacity_slots} does not match "
+                f"actual capacity {self.expert_cache.capacity_slots}"
+            )
 
         other_ms = total_ms - component_sum
         if other_ms < -1.0:
@@ -165,6 +181,7 @@ class TokenProfiler:
         return TokenResult(
             sample_id=sample_id,
             requested_context_length=requested_context_length,
+            cache_capacity_slots=cache_capacity_slots,
             measured_start_kv_length=measured_start_kv_length,
             measured_end_kv_length=measured_end_kv_length,
             decode_token=decode_token,
@@ -282,6 +299,31 @@ def expert_slots_for_context(
     return slots
 
 
+def validate_forced_cache_capacity(
+    capacity_slots: int,
+    gpu_budget_bytes: int,
+    non_expert_model_bytes: int,
+    target_kv_bytes: int,
+    runtime_reserve_bytes: int,
+    expert_size_bytes: int,
+) -> None:
+    """Reject an override that cannot fit in the configured GPU memory budget."""
+    if capacity_slots < 1:
+        raise ValueError("forced cache capacity must be at least one slot")
+    required_bytes = (
+        non_expert_model_bytes
+        + target_kv_bytes
+        + capacity_slots * expert_size_bytes
+        + runtime_reserve_bytes
+    )
+    if required_bytes > gpu_budget_bytes:
+        raise ValueError(
+            f"forced cache capacity {capacity_slots} needs {required_bytes / 1024**3:.2f} GiB, "
+            f"above configured GPU budget {gpu_budget_bytes / 1024**3:.2f} GiB "
+            f"for target KV {target_kv_bytes / 1024**3:.2f} GiB"
+        )
+
+
 NUMERIC_RESULT_FIELDS = (
     "total_ms",
     "attention_ms",
@@ -296,6 +338,7 @@ NUMERIC_RESULT_FIELDS = (
     "expert_accesses",
     "h2d_bytes",
     "kv_cache_bytes",
+    "cache_capacity_slots",
     "expert_cache_allocated_bytes",
     "expert_cache_resident_bytes",
     "expert_cache_capacity_slots",
@@ -342,8 +385,9 @@ class DecodeBenchmark:
         warmup_tokens: int,
         measure_tokens: int,
         prompt_input_ids: torch.Tensor,
+        forced_cache_capacity_slots: int | None,
         show_progress: bool,
-    ) -> list[TokenResult]:
+    ) -> ContextRun:
         max_positions = self.model.config.max_position_embeddings
         if context_length > max_positions:
             raise ValueError(
@@ -377,18 +421,38 @@ class DecodeBenchmark:
         prefill_kv_bytes = kv_cache_bytes(cache)
         bytes_per_kv_token = prefill_kv_bytes // prefill_length
         expected_start_kv_bytes = prefill_kv_bytes + bytes_per_kv_token * warmup_tokens
-        slots = expert_slots_for_context(
-            self.gpu_budget_bytes,
-            self.non_expert_model_bytes,
-            expected_start_kv_bytes,
-            self.runtime_reserve_bytes,
-            self.expert_cache.expert_size_bytes,
-        )
+        expected_end_kv_bytes = expected_start_kv_bytes + bytes_per_kv_token * measure_tokens
+        if forced_cache_capacity_slots is None:
+            slots = expert_slots_for_context(
+                self.gpu_budget_bytes,
+                self.non_expert_model_bytes,
+                expected_start_kv_bytes,
+                self.runtime_reserve_bytes,
+                self.expert_cache.expert_size_bytes,
+            )
+            capacity_source = "automatic"
+        else:
+            validate_forced_cache_capacity(
+                forced_cache_capacity_slots,
+                self.gpu_budget_bytes,
+                self.non_expert_model_bytes,
+                expected_end_kv_bytes,
+                self.runtime_reserve_bytes,
+                self.expert_cache.expert_size_bytes,
+            )
+            slots = forced_cache_capacity_slots
+            capacity_source = "override"
         self.expert_cache.set_capacity_slots(slots)
         self.expert_cache.clear()
-        print(f"Expert cache ready: {slots} preallocated slots; warming {warmup_tokens} decode tokens")
+        if self.expert_cache.capacity_slots != slots:
+            raise AssertionError(f"expert cache allocated {self.expert_cache.capacity_slots}, expected {slots}")
+        print(
+            f"Expert cache ready: {slots} preallocated slots ({capacity_source}); "
+            f"warming {warmup_tokens} decode tokens"
+        )
 
         next_token = prefill_output.logits[:, -1:].argmax(dim=-1)
+        generated_tokens: list[torch.Tensor] = []
         for _ in tqdm(
             range(warmup_tokens),
             desc=f"Warmup {context_length}",
@@ -397,6 +461,7 @@ class DecodeBenchmark:
         ):
             output = self.model(input_ids=next_token, past_key_values=cache, use_cache=True, logits_to_keep=1)
             next_token = output.logits[:, -1:].argmax(dim=-1)
+            generated_tokens.append(next_token)
         print("Warmup complete; synchronizing and resetting cache statistics")
         torch.cuda.synchronize()
 
@@ -429,6 +494,7 @@ class DecodeBenchmark:
             if not torch.isfinite(output.logits).all():
                 raise AssertionError("decode produced NaN or Inf logits")
             next_token = output.logits[:, -1:].argmax(dim=-1)
+            generated_tokens.append(next_token)
             if cache.get_seq_length() > max_positions:
                 raise AssertionError(
                     f"measured decode exceeded max positions: {cache.get_seq_length()} > {max_positions}"
@@ -437,6 +503,7 @@ class DecodeBenchmark:
                 self.profiler.finish(
                     sample_id=sample_id,
                     requested_context_length=context_length,
+                    cache_capacity_slots=slots,
                     measured_start_kv_length=measured_start_kv_length,
                     measured_end_kv_length=measured_end_kv_length,
                     decode_token=token_index,
@@ -462,7 +529,14 @@ class DecodeBenchmark:
                 f"actual={actual_growth:,}, expected={expected_growth:,}, "
                 f"tolerance={allocator_tolerance:,}"
             )
-        return results
+        if len(generated_tokens) != warmup_tokens + measure_tokens:
+            raise AssertionError("generated-token recording does not match warmup plus measured decode length")
+        generated_token_ids = torch.cat(generated_tokens, dim=1).to(device="cpu").tolist()[0]
+        return ContextRun(
+            token_results=results,
+            generated_token_ids=generated_token_ids,
+            cache_capacity_slots=slots,
+        )
 
 
 def _atomic_write(path: Path, write: Callable[[TextIO], None]) -> None:
@@ -502,15 +576,16 @@ def save_results(results: list[TokenResult], output_dir: Path, metadata: dict[st
         output_dir / "decode_tokens.csv",
     )
 
-    grouped: dict[tuple[str, int], list[TokenResult]] = defaultdict(list)
+    grouped: dict[tuple[str, int, int], list[TokenResult]] = defaultdict(list)
     for row in results:
-        grouped[(row.sample_id, row.requested_context_length)].append(row)
+        grouped[(row.sample_id, row.requested_context_length, row.cache_capacity_slots)].append(row)
     sample_summaries: list[dict[str, object]] = []
-    for (sample_id, context), rows in sorted(grouped.items()):
+    for (sample_id, context, capacity_slots), rows in sorted(grouped.items()):
         summary = average_results(rows)
         summary.update(
             sample_id=sample_id,
             requested_context_length=context,
+            cache_capacity_slots=capacity_slots,
             measured_start_kv_length=rows[0].measured_start_kv_length,
             measured_end_kv_length=rows[0].measured_end_kv_length,
             measured_tokens=len(rows),
@@ -522,18 +597,25 @@ def save_results(results: list[TokenResult], output_dir: Path, metadata: dict[st
         output_dir / "decode_sample_context_summary.json",
         output_dir / "decode_sample_context_summary.csv",
     )
+    _write_json_csv(
+        sample_summaries,
+        output_dir / "decode_capacity_summary.json",
+        output_dir / "decode_capacity_summary.csv",
+    )
 
-    context_groups: dict[int, list[dict[str, object]]] = defaultdict(list)
+    context_groups: dict[tuple[int, int], list[dict[str, object]]] = defaultdict(list)
     for summary in sample_summaries:
-        context_groups[int(summary["requested_context_length"])].append(summary)
+        key = (int(summary["requested_context_length"]), int(summary["cache_capacity_slots"]))
+        context_groups[key].append(summary)
     summaries: list[dict[str, object]] = []
-    for context, rows in sorted(context_groups.items()):
+    for (context, capacity_slots), rows in sorted(context_groups.items()):
         if len({int(row["measured_start_kv_length"]) for row in rows}) != 1:
             raise AssertionError("sample summaries disagree on measured start KV length")
         if len({int(row["measured_end_kv_length"]) for row in rows}) != 1:
             raise AssertionError("sample summaries disagree on measured end KV length")
         summary: dict[str, object] = {
             "requested_context_length": context,
+            "cache_capacity_slots": capacity_slots,
             "measured_start_kv_length": rows[0]["measured_start_kv_length"],
             "measured_end_kv_length": rows[0]["measured_end_kv_length"],
             "num_samples": len(rows),
@@ -551,17 +633,17 @@ def save_results(results: list[TokenResult], output_dir: Path, metadata: dict[st
 
     print()
     print(
-        "Requested | Samples | Measured KV Range | KV GiB | Cache Capacity Slots | Resident Slots | "
+        "Requested | Slots | Samples | Measured KV Range | KV GiB | Resident Slots | "
         "Cache Allocated GiB | Cache Resident GiB | Hit Rate | Accesses/token | H2D GB/token | "
         "Host Staging ms | Attention ms | Router ms | H2D ms | Expert Compute ms | Other ms | TPOT ms"
     )
     for row in summaries:
         print(
             f"{int(row['requested_context_length']):9d} | "
+            f"{int(row['cache_capacity_slots']):5d} | "
             f"{int(row['num_samples']):7d} | "
             f"{int(row['measured_start_kv_length']):5d}->{int(row['measured_end_kv_length']):5d} | "
             f"{row['kv_cache_bytes'] / 1024**3:6.2f} | "
-            f"{row['expert_cache_capacity_slots']:20.1f} | "
             f"{row['expert_cache_resident_slots']:14.1f} | "
             f"{row['expert_cache_allocated_bytes'] / 1024**3:19.2f} | "
             f"{row['expert_cache_resident_bytes'] / 1024**3:18.2f} | "
@@ -586,6 +668,12 @@ def main() -> None:
     parser.add_argument("--measure-tokens", type=int, default=DEFAULT_MEASURE_TOKENS)
     parser.add_argument("--num-samples", type=int, default=1)
     parser.add_argument("--sample-seed", type=int, default=42)
+    parser.add_argument(
+        "--cache-capacities",
+        nargs="+",
+        type=int,
+        help="override GPU expert-cache capacity with explicit expert-slot counts",
+    )
     parser.add_argument("--no-progress", action="store_true", help="suppress warmup/decode progress bars")
     parser.add_argument("--gpu-budget-gib", type=float, default=GPU_BUDGET_GIB)
     parser.add_argument("--runtime-reserve-gib", type=float, default=RUNTIME_RESERVE_GIB)
@@ -600,6 +688,13 @@ def main() -> None:
     if longest_prefill_length < 1:
         raise ValueError("warmup and measured tokens leave no prefill tokens")
     selection_prompt_length = max(longest_prefill_length, SAMPLE_SELECTION_PROMPT_LENGTH)
+    cache_capacities = None
+    if args.cache_capacities is not None:
+        if any(capacity < 1 for capacity in args.cache_capacities):
+            raise ValueError("cache capacities must be at least one slot")
+        if len(set(args.cache_capacities)) != len(args.cache_capacities):
+            raise ValueError("cache capacities must not contain duplicates")
+        cache_capacities = sorted(args.cache_capacities, reverse=True)
 
     print(f"Loading Mixtral tokenizer: {args.model}")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
@@ -622,7 +717,13 @@ def main() -> None:
         "warmup_tokens": args.warmup_tokens,
         "measure_tokens": args.measure_tokens,
         "sample_selection_prompt_length": selection_prompt_length,
+        "cache_capacity_mode": "override" if cache_capacities is not None else "automatic",
+        "requested_cache_capacities": cache_capacities,
+        "expert_size_bytes": benchmark.expert_cache.expert_size_bytes,
+        "gpu_budget_bytes": benchmark.gpu_budget_bytes,
+        "runtime_reserve_bytes": benchmark.runtime_reserve_bytes,
         "completed_runs": [],
+        "generated_token_sequences": [],
     }
     for sample in samples:
         for context_length in args.contexts:
@@ -635,21 +736,56 @@ def main() -> None:
                 raise AssertionError(
                     f"input_ids length {prompt_input_ids.shape[-1]} does not equal {prefill_length}"
                 )
-            print(f"Running sample {sample.sample_id}, context length {context_length}")
-            context_results = benchmark.run_context(
-                sample.sample_id,
-                context_length,
-                args.warmup_tokens,
-                args.measure_tokens,
-                prompt_input_ids,
-                not args.no_progress,
-            )
-            all_results.extend(context_results)
-            completed_runs = metadata["completed_runs"]
-            assert isinstance(completed_runs, list)
-            completed_runs.append({"sample_id": sample.sample_id, "context_length": context_length})
-            save_results(all_results, args.output_dir, metadata)
-            print(f"Checkpointed sample {sample.sample_id}, context length {context_length}")
+            capacities = cache_capacities if cache_capacities is not None else [None]
+            reference_generated_tokens: list[int] | None = None
+            reference_capacity: int | None = None
+            for forced_capacity in capacities:
+                capacity_label = "automatic" if forced_capacity is None else str(forced_capacity)
+                print(
+                    f"Running sample {sample.sample_id}, context length {context_length}, "
+                    f"cache capacity {capacity_label}"
+                )
+                context_run = benchmark.run_context(
+                    sample.sample_id,
+                    context_length,
+                    args.warmup_tokens,
+                    args.measure_tokens,
+                    prompt_input_ids,
+                    forced_capacity,
+                    not args.no_progress,
+                )
+                if reference_generated_tokens is None:
+                    reference_generated_tokens = context_run.generated_token_ids
+                    reference_capacity = context_run.cache_capacity_slots
+                elif context_run.generated_token_ids != reference_generated_tokens:
+                    raise AssertionError(
+                        f"generated token sequence differs at cache capacity {context_run.cache_capacity_slots}; "
+                        f"reference capacity is {reference_capacity}"
+                    )
+                all_results.extend(context_run.token_results)
+                completed_runs = metadata["completed_runs"]
+                generated_sequences = metadata["generated_token_sequences"]
+                assert isinstance(completed_runs, list) and isinstance(generated_sequences, list)
+                completed_runs.append(
+                    {
+                        "sample_id": sample.sample_id,
+                        "context_length": context_length,
+                        "cache_capacity_slots": context_run.cache_capacity_slots,
+                    }
+                )
+                generated_sequences.append(
+                    {
+                        "sample_id": sample.sample_id,
+                        "context_length": context_length,
+                        "cache_capacity_slots": context_run.cache_capacity_slots,
+                        "token_ids": context_run.generated_token_ids,
+                    }
+                )
+                save_results(all_results, args.output_dir, metadata)
+                print(
+                    f"Checkpointed sample {sample.sample_id}, context length {context_length}, "
+                    f"cache capacity {context_run.cache_capacity_slots}"
+                )
 
 
 if __name__ == "__main__":
