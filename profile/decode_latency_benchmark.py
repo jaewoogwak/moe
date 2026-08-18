@@ -50,8 +50,10 @@ class TokenResult:
     expert_accesses: int
     h2d_bytes: int
     kv_cache_bytes: int
-    expert_cache_bytes: int
-    expert_cache_slots: int
+    expert_cache_allocated_bytes: int
+    expert_cache_resident_bytes: int
+    expert_cache_capacity_slots: int
+    expert_cache_resident_slots: int
 
 
 class TokenProfiler:
@@ -131,6 +133,16 @@ class TokenProfiler:
                 f"expected {self.expected_expert_accesses} expert accesses for batch-1 decode, "
                 f"observed {expert_accesses}"
             )
+        if self.expert_cache.allocated_bytes != (
+            self.expert_cache.capacity_slots * self.expert_cache.expert_size_bytes
+        ):
+            raise AssertionError("expert-cache allocated bytes do not match its slot capacity")
+        if self.expert_cache.resident_bytes != (
+            self.expert_cache.resident_slots * self.expert_cache.expert_size_bytes
+        ):
+            raise AssertionError("expert-cache resident bytes do not match its occupied slots")
+        if self.expert_cache.resident_slots > self.expert_cache.capacity_slots:
+            raise AssertionError("expert-cache residency exceeds its slot capacity")
 
         other_ms = total_ms - component_sum
         if other_ms < -1.0:
@@ -157,8 +169,10 @@ class TokenProfiler:
             expert_accesses=expert_accesses,
             h2d_bytes=h2d_bytes,
             kv_cache_bytes=kv_cache_bytes,
-            expert_cache_bytes=self.expert_cache.resident_bytes,
-            expert_cache_slots=self.expert_cache.capacity_slots,
+            expert_cache_allocated_bytes=self.expert_cache.allocated_bytes,
+            expert_cache_resident_bytes=self.expert_cache.resident_bytes,
+            expert_cache_capacity_slots=self.expert_cache.capacity_slots,
+            expert_cache_resident_slots=self.expert_cache.resident_slots,
         )
 
 
@@ -274,8 +288,10 @@ def average_results(results: list[TokenResult]) -> dict[str, float]:
         "expert_accesses",
         "h2d_bytes",
         "kv_cache_bytes",
-        "expert_cache_bytes",
-        "expert_cache_slots",
+        "expert_cache_allocated_bytes",
+        "expert_cache_resident_bytes",
+        "expert_cache_capacity_slots",
+        "expert_cache_resident_slots",
     )
     return {field: sum(getattr(row, field) for row in results) / count for field in numeric_fields}
 
@@ -438,7 +454,8 @@ def save_results(results: list[TokenResult], output_dir: Path) -> None:
 
     print()
     print(
-        "Requested | Measured KV Range | KV GiB | Expert Slots | Hit Rate | Accesses/token | H2D GB/token | "
+        "Requested | Measured KV Range | KV GiB | Cache Capacity Slots | Resident Slots | "
+        "Cache Allocated GiB | Cache Resident GiB | Hit Rate | Accesses/token | H2D GB/token | "
         "Host Staging ms | Attention ms | Router ms | H2D ms | Expert Compute ms | Other ms | TPOT ms"
     )
     for row in summaries:
@@ -446,7 +463,10 @@ def save_results(results: list[TokenResult], output_dir: Path) -> None:
             f"{int(row['requested_context_length']):9d} | "
             f"{int(row['measured_start_kv_length']):5d}->{int(row['measured_end_kv_length']):5d} | "
             f"{row['kv_cache_bytes'] / 1024**3:6.2f} | "
-            f"{row['expert_cache_slots']:12.1f} | "
+            f"{row['expert_cache_capacity_slots']:20.1f} | "
+            f"{row['expert_cache_resident_slots']:14.1f} | "
+            f"{row['expert_cache_allocated_bytes'] / 1024**3:19.2f} | "
+            f"{row['expert_cache_resident_bytes'] / 1024**3:18.2f} | "
             f"{row['hit_rate']:8.3f} | "
             f"{row['expert_accesses']:14.1f} | "
             f"{row['h2d_bytes'] / 1e9:12.3f} | "
