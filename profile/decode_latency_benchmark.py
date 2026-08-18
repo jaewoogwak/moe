@@ -33,7 +33,9 @@ RUNTIME_RESERVE_GIB = 1.0
 
 @dataclass
 class TokenResult:
-    context_length: int
+    requested_context_length: int
+    measured_start_kv_length: int
+    measured_end_kv_length: int
     decode_token: int
     total_ms: float
     attention_ms: float
@@ -98,7 +100,9 @@ class TokenProfiler:
 
     def finish(
         self,
-        context_length: int,
+        requested_context_length: int,
+        measured_start_kv_length: int,
+        measured_end_kv_length: int,
         decode_token: int,
         total_ms: float,
         kv_cache_bytes: int,
@@ -116,7 +120,7 @@ class TokenProfiler:
         expert_compute_ms = elapsed("expert_compute")
         h2d_bytes = cache_after.h2d_bytes - self._cache_before.h2d_bytes
         host_staging_ms = cache_after.host_staging_ms - self._cache_before.host_staging_ms
-        component_sum = attention_ms + router_ms + host_staging_ms + h2d_ms + expert_compute_ms
+        component_sum = attention_ms + router_ms + h2d_ms + expert_compute_ms
         misses = cache_after.misses - self._cache_before.misses
         hits = cache_after.hits - self._cache_before.hits
         expert_accesses = hits + misses
@@ -132,11 +136,13 @@ class TokenProfiler:
         if other_ms < -1.0:
             print(
                 f"WARNING: latency component sum exceeds total by {-other_ms:.2f} ms "
-                f"at context {context_length}, token {decode_token}"
+                f"at requested context {requested_context_length}, token {decode_token}"
             )
         self.active = False
         return TokenResult(
-            context_length=context_length,
+            requested_context_length=requested_context_length,
+            measured_start_kv_length=measured_start_kv_length,
+            measured_end_kv_length=measured_end_kv_length,
             decode_token=decode_token,
             total_ms=total_ms,
             attention_ms=attention_ms,
@@ -325,6 +331,19 @@ class DecodeBenchmark:
         cache = DynamicCache(config=self.model.config)
         prefill_output = self.model(input_ids=prompt, past_key_values=cache, use_cache=True, logits_to_keep=1)
 
+        prefill_kv_bytes = kv_cache_bytes(cache)
+        bytes_per_kv_token = prefill_kv_bytes // prefill_length
+        expected_start_kv_bytes = prefill_kv_bytes + bytes_per_kv_token * warmup_tokens
+        slots = expert_slots_for_context(
+            self.gpu_budget_bytes,
+            self.non_expert_model_bytes,
+            expected_start_kv_bytes,
+            self.runtime_reserve_bytes,
+            self.expert_cache.expert_size_bytes,
+        )
+        self.expert_cache.set_capacity_slots(slots)
+        self.expert_cache.clear()
+
         next_token = prefill_output.logits[:, -1:].argmax(dim=-1)
         for _ in range(warmup_tokens):
             output = self.model(input_ids=next_token, past_key_values=cache, use_cache=True, logits_to_keep=1)
@@ -336,15 +355,10 @@ class DecodeBenchmark:
                 f"KV length after warmup is {cache.get_seq_length()}, expected {measured_start_kv_length}"
             )
         kv_before = kv_cache_bytes(cache)
-        slots = expert_slots_for_context(
-            self.gpu_budget_bytes,
-            self.non_expert_model_bytes,
-            kv_before,
-            self.runtime_reserve_bytes,
-            self.expert_cache.expert_size_bytes,
-        )
-        self.expert_cache.set_capacity_slots(slots)
-        self.expert_cache.clear()
+        if kv_before != expected_start_kv_bytes:
+            raise AssertionError(
+                f"actual warmup KV bytes {kv_before} differ from expected {expected_start_kv_bytes}"
+            )
         self.expert_cache.reset_stats()
 
         memory_before = torch.cuda.memory_allocated()
@@ -366,7 +380,9 @@ class DecodeBenchmark:
                 )
             results.append(
                 self.profiler.finish(
-                    context_length=context_length,
+                    requested_context_length=context_length,
+                    measured_start_kv_length=measured_start_kv_length,
+                    measured_end_kv_length=measured_start_kv_length + measure_tokens,
                     decode_token=token_index,
                     total_ms=total_ms,
                     kv_cache_bytes=kv_cache_bytes(cache),
@@ -404,11 +420,13 @@ def save_results(results: list[TokenResult], output_dir: Path) -> None:
 
     grouped: dict[int, list[TokenResult]] = defaultdict(list)
     for row in results:
-        grouped[row.context_length].append(row)
+        grouped[row.requested_context_length].append(row)
     summaries = []
     for context, rows in grouped.items():
         summary = average_results(rows)
-        summary["context_length"] = context
+        summary["requested_context_length"] = context
+        summary["measured_start_kv_length"] = rows[0].measured_start_kv_length
+        summary["measured_end_kv_length"] = rows[0].measured_end_kv_length
         summary["hit_rate"] = summary["cache_hits"] / max(1.0, summary["cache_hits"] + summary["cache_misses"])
         summaries.append(summary)
     with (output_dir / "decode_summary.json").open("w") as handle:
@@ -420,12 +438,13 @@ def save_results(results: list[TokenResult], output_dir: Path) -> None:
 
     print()
     print(
-        "Context | KV GiB | Expert Slots | Hit Rate | Accesses/token | H2D GB/token | "
+        "Requested | Measured KV Range | KV GiB | Expert Slots | Hit Rate | Accesses/token | H2D GB/token | "
         "Host Staging ms | Attention ms | Router ms | H2D ms | Expert Compute ms | Other ms | TPOT ms"
     )
     for row in summaries:
         print(
-            f"{int(row['context_length']):7d} | "
+            f"{int(row['requested_context_length']):9d} | "
+            f"{int(row['measured_start_kv_length']):5d}->{int(row['measured_end_kv_length']):5d} | "
             f"{row['kv_cache_bytes'] / 1024**3:6.2f} | "
             f"{row['expert_cache_slots']:12.1f} | "
             f"{row['hit_rate']:8.3f} | "
