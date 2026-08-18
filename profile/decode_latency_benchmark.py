@@ -23,7 +23,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from offload.expert_cache import ExpertCacheStats, GPUExpertCache
+from offload.expert_cache import (
+    FIXED_PER_LAYER_LRU,
+    GLOBAL_LAYER_BALANCED_LRU,
+    VALID_CACHE_POLICIES,
+    ExpertCacheStats,
+    GPUExpertCache,
+)
 from offload.host_expert_store import HostExpertStore
 from offload.offloaded_experts import CachedOffloadedMixtralExperts, replace_with_cached_offloaded_experts
 from data.longbench_v2 import DATASET_NAME, LongBenchSample, build_prompt_input_ids, load_deterministic_samples
@@ -72,6 +78,7 @@ class ContextRun:
     token_results: list[TokenResult]
     generated_token_ids: list[int]
     cache_capacity_slots: int
+    layer_capacities: tuple[int, ...] | None
 
 
 class TokenProfiler:
@@ -354,7 +361,13 @@ def average_results(results: list[TokenResult]) -> dict[str, float]:
 
 
 class DecodeBenchmark:
-    def __init__(self, model_path: str, gpu_budget_gib: float, runtime_reserve_gib: float) -> None:
+    def __init__(
+        self,
+        model_path: str,
+        gpu_budget_gib: float,
+        runtime_reserve_gib: float,
+        cache_policy: str,
+    ) -> None:
         self.model_path = model_path
         self.gpu_budget_bytes = int(gpu_budget_gib * 1024**3)
         self.runtime_reserve_bytes = int(runtime_reserve_gib * 1024**3)
@@ -369,7 +382,14 @@ class DecodeBenchmark:
         self.model.eval()
         self.host_store = HostExpertStore(self.model)
         move_non_expert_modules_to_cuda(self.model)
-        self.expert_cache = GPUExpertCache(self.host_store, capacity_slots=1)
+        prefill_capacity_slots = (
+            self.host_store.NUM_LAYERS if cache_policy == FIXED_PER_LAYER_LRU else 1
+        )
+        self.expert_cache = GPUExpertCache(
+            self.host_store,
+            capacity_slots=prefill_capacity_slots,
+            cache_policy=cache_policy,
+        )
         replace_with_cached_offloaded_experts(self.model, self.expert_cache)
         validate_placement(self.model, self.host_store)
         self.non_expert_model_bytes = model_gpu_bytes(self.model)
@@ -411,7 +431,12 @@ class DecodeBenchmark:
             f"measured_end_kv_length={measured_end_kv_length}"
         )
         self.expert_cache.clear()
-        self.expert_cache.set_capacity_slots(1)
+        prefill_capacity_slots = (
+            self.host_store.NUM_LAYERS
+            if self.expert_cache.cache_policy == FIXED_PER_LAYER_LRU
+            else 1
+        )
+        self.expert_cache.set_capacity_slots(prefill_capacity_slots)
         prompt = prompt_input_ids.to(device="cuda")
         cache = DynamicCache(config=self.model.config)
         print(f"Prefill: {prefill_length} prompt tokens (one full-context forward)")
@@ -432,6 +457,14 @@ class DecodeBenchmark:
             )
             capacity_source = "automatic"
         else:
+            if (
+                self.expert_cache.cache_policy == FIXED_PER_LAYER_LRU
+                and forced_cache_capacity_slots < self.host_store.NUM_LAYERS
+            ):
+                raise ValueError(
+                    f"fixed_per_layer_lru requires at least {self.host_store.NUM_LAYERS} slots, "
+                    f"got {forced_cache_capacity_slots}"
+                )
             validate_forced_cache_capacity(
                 forced_cache_capacity_slots,
                 self.gpu_budget_bytes,
@@ -442,6 +475,13 @@ class DecodeBenchmark:
             )
             slots = forced_cache_capacity_slots
             capacity_source = "override"
+        if (
+            self.expert_cache.cache_policy == FIXED_PER_LAYER_LRU
+            and slots < self.host_store.NUM_LAYERS
+        ):
+            raise ValueError(
+                f"fixed_per_layer_lru requires at least {self.host_store.NUM_LAYERS} slots, got {slots}"
+            )
         self.expert_cache.set_capacity_slots(slots)
         self.expert_cache.clear()
         if self.expert_cache.capacity_slots != slots:
@@ -536,6 +576,7 @@ class DecodeBenchmark:
             token_results=results,
             generated_token_ids=generated_token_ids,
             cache_capacity_slots=slots,
+            layer_capacities=self.expert_cache.layer_capacities,
         )
 
 
@@ -669,6 +710,12 @@ def main() -> None:
     parser.add_argument("--num-samples", type=int, default=1)
     parser.add_argument("--sample-seed", type=int, default=42)
     parser.add_argument(
+        "--cache-policy",
+        choices=VALID_CACHE_POLICIES,
+        default=FIXED_PER_LAYER_LRU,
+        help="GPU expert-cache eviction policy",
+    )
+    parser.add_argument(
         "--cache-capacities",
         nargs="+",
         type=int,
@@ -706,7 +753,12 @@ def main() -> None:
     )
     print(f"LongBench v2 samples (seed={args.sample_seed}): {[sample.sample_id for sample in samples]}")
 
-    benchmark = DecodeBenchmark(args.model, args.gpu_budget_gib, args.runtime_reserve_gib)
+    benchmark = DecodeBenchmark(
+        args.model,
+        args.gpu_budget_gib,
+        args.runtime_reserve_gib,
+        args.cache_policy,
+    )
     all_results: list[TokenResult] = []
     metadata: dict[str, object] = {
         "model": args.model,
@@ -716,6 +768,9 @@ def main() -> None:
         "contexts": args.contexts,
         "warmup_tokens": args.warmup_tokens,
         "measure_tokens": args.measure_tokens,
+        "cache_policy": args.cache_policy,
+        "total_expert_cache_slots": None,
+        "per_layer_cache_capacities": None,
         "sample_selection_prompt_length": selection_prompt_length,
         "cache_capacity_mode": "override" if cache_capacities is not None else "automatic",
         "requested_cache_capacities": cache_capacities,
@@ -771,6 +826,12 @@ def main() -> None:
                         "sample_id": sample.sample_id,
                         "context_length": context_length,
                         "cache_capacity_slots": context_run.cache_capacity_slots,
+                        "cache_policy": args.cache_policy,
+                        "per_layer_cache_capacities": (
+                            list(context_run.layer_capacities)
+                            if context_run.layer_capacities is not None
+                            else None
+                        ),
                     }
                 )
                 generated_sequences.append(
@@ -780,6 +841,12 @@ def main() -> None:
                         "cache_capacity_slots": context_run.cache_capacity_slots,
                         "token_ids": context_run.generated_token_ids,
                     }
+                )
+                metadata["total_expert_cache_slots"] = context_run.cache_capacity_slots
+                metadata["per_layer_cache_capacities"] = (
+                    list(context_run.layer_capacities)
+                    if context_run.layer_capacities is not None
+                    else None
                 )
                 save_results(all_results, args.output_dir, metadata)
                 print(
