@@ -15,6 +15,7 @@ from statistics import mean, pstdev
 from typing import Iterator
 
 import torch
+from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -338,6 +339,7 @@ class DecodeBenchmark:
         warmup_tokens: int,
         measure_tokens: int,
         prompt_input_ids: torch.Tensor,
+        show_progress: bool,
     ) -> list[TokenResult]:
         max_positions = self.model.config.max_position_embeddings
         if context_length > max_positions:
@@ -365,8 +367,10 @@ class DecodeBenchmark:
         self.expert_cache.set_capacity_slots(1)
         prompt = prompt_input_ids.to(device="cuda")
         cache = DynamicCache(config=self.model.config)
+        print(f"Prefill: {prefill_length} prompt tokens (one full-context forward)")
         prefill_output = self.model(input_ids=prompt, past_key_values=cache, use_cache=True, logits_to_keep=1)
 
+        print("Prefill complete; calculating and allocating expert-cache slots")
         prefill_kv_bytes = kv_cache_bytes(cache)
         bytes_per_kv_token = prefill_kv_bytes // prefill_length
         expected_start_kv_bytes = prefill_kv_bytes + bytes_per_kv_token * warmup_tokens
@@ -379,11 +383,18 @@ class DecodeBenchmark:
         )
         self.expert_cache.set_capacity_slots(slots)
         self.expert_cache.clear()
+        print(f"Expert cache ready: {slots} preallocated slots; warming {warmup_tokens} decode tokens")
 
         next_token = prefill_output.logits[:, -1:].argmax(dim=-1)
-        for _ in range(warmup_tokens):
+        for _ in tqdm(
+            range(warmup_tokens),
+            desc=f"Warmup {context_length}",
+            unit="token",
+            disable=not show_progress,
+        ):
             output = self.model(input_ids=next_token, past_key_values=cache, use_cache=True, logits_to_keep=1)
             next_token = output.logits[:, -1:].argmax(dim=-1)
+        print("Warmup complete; synchronizing and resetting cache statistics")
         torch.cuda.synchronize()
 
         if cache.get_seq_length() != measured_start_kv_length:
@@ -400,7 +411,12 @@ class DecodeBenchmark:
         memory_before = torch.cuda.memory_allocated()
         resident_cache_before = self.expert_cache.allocated_bytes
         results: list[TokenResult] = []
-        for token_index in range(measure_tokens):
+        for token_index in tqdm(
+            range(measure_tokens),
+            desc=f"Measure {context_length}",
+            unit="token",
+            disable=not show_progress,
+        ):
             torch.cuda.synchronize()
             self.profiler.begin()
             start = time.perf_counter()
@@ -550,6 +566,7 @@ def main() -> None:
     parser.add_argument("--measure-tokens", type=int, default=DEFAULT_MEASURE_TOKENS)
     parser.add_argument("--num-samples", type=int, default=1)
     parser.add_argument("--sample-seed", type=int, default=42)
+    parser.add_argument("--no-progress", action="store_true", help="suppress warmup/decode progress bars")
     parser.add_argument("--gpu-budget-gib", type=float, default=GPU_BUDGET_GIB)
     parser.add_argument("--runtime-reserve-gib", type=float, default=RUNTIME_RESERVE_GIB)
     parser.add_argument("--output-dir", type=Path, default=Path("results/decode_latency"))
@@ -595,6 +612,7 @@ def main() -> None:
                     args.warmup_tokens,
                     args.measure_tokens,
                     prompt_input_ids,
+                    not args.no_progress,
                 )
             )
     metadata = {
