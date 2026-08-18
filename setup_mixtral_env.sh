@@ -109,6 +109,7 @@ echo "============================================================"
 python -m pip install -U \
     transformers \
     accelerate \
+    datasets \
     huggingface_hub \
     safetensors \
     sentencepiece \
@@ -138,6 +139,7 @@ import sys
 import torch
 import transformers
 import accelerate
+import datasets
 import huggingface_hub
 import numpy
 import pandas
@@ -151,6 +153,7 @@ print(f"PyTorch           : {torch.__version__}")
 print(f"PyTorch CUDA      : {torch.version.cuda}")
 print(f"Transformers      : {transformers.__version__}")
 print(f"Accelerate        : {accelerate.__version__}")
+print(f"Datasets          : {datasets.__version__}")
 print(f"HuggingFace Hub   : {huggingface_hub.__version__}")
 print(f"NumPy             : {numpy.__version__}")
 print(f"Pandas            : {pandas.__version__}")

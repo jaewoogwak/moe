@@ -11,10 +11,11 @@ from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from statistics import mean, pstdev
 from typing import Iterator
 
 import torch
-from transformers import AutoModelForCausalLM, DynamicCache
+from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -23,16 +24,21 @@ if str(PROJECT_ROOT) not in sys.path:
 from offload.expert_cache import ExpertCacheStats, GPUExpertCache
 from offload.host_expert_store import HostExpertStore
 from offload.offloaded_experts import CachedOffloadedMixtralExperts, replace_with_cached_offloaded_experts
+from data.longbench_v2 import DATASET_NAME, LongBenchSample, build_prompt_input_ids, load_deterministic_samples
 
 
 MODEL = "/workspace/models/Mixtral-8x7B-Instruct-v0.1"
 DEFAULT_CONTEXTS = (4096, 8192, 16384, 24576, 32768)
 GPU_BUDGET_GIB = 22.0
 RUNTIME_RESERVE_GIB = 1.0
+DEFAULT_WARMUP_TOKENS = 16
+DEFAULT_MEASURE_TOKENS = 64
+SAMPLE_SELECTION_PROMPT_LENGTH = 32768 - DEFAULT_WARMUP_TOKENS - DEFAULT_MEASURE_TOKENS
 
 
 @dataclass
 class TokenResult:
+    sample_id: str
     requested_context_length: int
     measured_start_kv_length: int
     measured_end_kv_length: int
@@ -102,6 +108,7 @@ class TokenProfiler:
 
     def finish(
         self,
+        sample_id: str,
         requested_context_length: int,
         measured_start_kv_length: int,
         measured_end_kv_length: int,
@@ -152,6 +159,7 @@ class TokenProfiler:
             )
         self.active = False
         return TokenResult(
+            sample_id=sample_id,
             requested_context_length=requested_context_length,
             measured_start_kv_length=measured_start_kv_length,
             measured_end_kv_length=measured_end_kv_length,
@@ -270,30 +278,32 @@ def expert_slots_for_context(
     return slots
 
 
+NUMERIC_RESULT_FIELDS = (
+    "total_ms",
+    "attention_ms",
+    "router_ms",
+    "expert_h2d_ms",
+    "host_staging_ms",
+    "expert_compute_ms",
+    "other_ms",
+    "cache_hits",
+    "cache_misses",
+    "cache_evictions",
+    "expert_accesses",
+    "h2d_bytes",
+    "kv_cache_bytes",
+    "expert_cache_allocated_bytes",
+    "expert_cache_resident_bytes",
+    "expert_cache_capacity_slots",
+    "expert_cache_resident_slots",
+)
+
+
 def average_results(results: list[TokenResult]) -> dict[str, float]:
     count = len(results)
     if count == 0:
         raise ValueError("no token results")
-    numeric_fields = (
-        "total_ms",
-        "attention_ms",
-        "router_ms",
-        "expert_h2d_ms",
-        "host_staging_ms",
-        "expert_compute_ms",
-        "other_ms",
-        "cache_hits",
-        "cache_misses",
-        "cache_evictions",
-        "expert_accesses",
-        "h2d_bytes",
-        "kv_cache_bytes",
-        "expert_cache_allocated_bytes",
-        "expert_cache_resident_bytes",
-        "expert_cache_capacity_slots",
-        "expert_cache_resident_slots",
-    )
-    return {field: sum(getattr(row, field) for row in results) / count for field in numeric_fields}
+    return {field: sum(getattr(row, field) for row in results) / count for field in NUMERIC_RESULT_FIELDS}
 
 
 class DecodeBenchmark:
@@ -321,29 +331,39 @@ class DecodeBenchmark:
         self.hooks = attach_module_timers(self.model, self.profiler)
 
     @torch.inference_mode()
-    def run_context(self, context_length: int, warmup_tokens: int, measure_tokens: int) -> list[TokenResult]:
+    def run_context(
+        self,
+        sample_id: str,
+        context_length: int,
+        warmup_tokens: int,
+        measure_tokens: int,
+        prompt_input_ids: torch.Tensor,
+    ) -> list[TokenResult]:
         max_positions = self.model.config.max_position_embeddings
-        measured_start_kv_length = min(context_length, max_positions - measure_tokens)
+        if context_length > max_positions:
+            raise ValueError(
+                f"requested context {context_length} exceeds native context window {max_positions}"
+            )
+        measured_end_kv_length = context_length
+        measured_start_kv_length = measured_end_kv_length - measure_tokens
         if measured_start_kv_length < 1:
             raise ValueError("requested measured-token count leaves no valid prefill length")
         prefill_length = measured_start_kv_length - warmup_tokens
         if prefill_length < 1:
             raise ValueError("warmup_tokens must be smaller than the measured start KV length")
+        if prompt_input_ids.shape != (1, prefill_length):
+            raise AssertionError(
+                f"input_ids shape {tuple(prompt_input_ids.shape)} does not equal (1, {prefill_length})"
+            )
 
         print(
-            f"Context plan: requested={context_length}, prefill_length={prefill_length}, "
+            f"Context plan: sample={sample_id}, requested={context_length}, prefill_length={prefill_length}, "
             f"measured_start_kv_length={measured_start_kv_length}, "
-            f"measured_end_kv_length={measured_start_kv_length + measure_tokens}"
+            f"measured_end_kv_length={measured_end_kv_length}"
         )
         self.expert_cache.clear()
         self.expert_cache.set_capacity_slots(1)
-        prompt = torch.randint(
-            0,
-            self.model.config.vocab_size,
-            (1, prefill_length),
-            dtype=torch.long,
-            device="cuda",
-        )
+        prompt = prompt_input_ids.to(device="cuda")
         cache = DynamicCache(config=self.model.config)
         prefill_output = self.model(input_ids=prompt, past_key_values=cache, use_cache=True, logits_to_keep=1)
 
@@ -393,12 +413,13 @@ class DecodeBenchmark:
             if cache.get_seq_length() > max_positions:
                 raise AssertionError(
                     f"measured decode exceeded max positions: {cache.get_seq_length()} > {max_positions}"
-                )
+            )
             results.append(
                 self.profiler.finish(
+                    sample_id=sample_id,
                     requested_context_length=context_length,
                     measured_start_kv_length=measured_start_kv_length,
-                    measured_end_kv_length=measured_start_kv_length + measure_tokens,
+                    measured_end_kv_length=measured_end_kv_length,
                     decode_token=token_index,
                     total_ms=total_ms,
                     kv_cache_bytes=kv_cache_bytes(cache),
@@ -425,42 +446,83 @@ class DecodeBenchmark:
         return results
 
 
-def save_results(results: list[TokenResult], output_dir: Path) -> None:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    with (output_dir / "decode_tokens.json").open("w") as handle:
-        json.dump([asdict(row) for row in results], handle, indent=2)
-    with (output_dir / "decode_tokens.csv").open("w", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(asdict(results[0]).keys()))
+def _write_json_csv(rows: list[dict[str, object]], json_path: Path, csv_path: Path) -> None:
+    with json_path.open("w") as handle:
+        json.dump(rows, handle, indent=2)
+    with csv_path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
         writer.writeheader()
-        writer.writerows(asdict(row) for row in results)
+        writer.writerows(rows)
 
-    grouped: dict[int, list[TokenResult]] = defaultdict(list)
+
+def save_results(results: list[TokenResult], output_dir: Path, metadata: dict[str, object]) -> None:
+    if not results:
+        raise ValueError("no token results to save")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _write_json_csv(
+        [asdict(row) for row in results],
+        output_dir / "decode_tokens.json",
+        output_dir / "decode_tokens.csv",
+    )
+    with (output_dir / "decode_metadata.json").open("w") as handle:
+        json.dump(metadata, handle, indent=2)
+
+    grouped: dict[tuple[str, int], list[TokenResult]] = defaultdict(list)
     for row in results:
-        grouped[row.requested_context_length].append(row)
-    summaries = []
-    for context, rows in grouped.items():
+        grouped[(row.sample_id, row.requested_context_length)].append(row)
+    sample_summaries: list[dict[str, object]] = []
+    for (sample_id, context), rows in sorted(grouped.items()):
         summary = average_results(rows)
-        summary["requested_context_length"] = context
-        summary["measured_start_kv_length"] = rows[0].measured_start_kv_length
-        summary["measured_end_kv_length"] = rows[0].measured_end_kv_length
+        summary.update(
+            sample_id=sample_id,
+            requested_context_length=context,
+            measured_start_kv_length=rows[0].measured_start_kv_length,
+            measured_end_kv_length=rows[0].measured_end_kv_length,
+            measured_tokens=len(rows),
+        )
         summary["hit_rate"] = summary["cache_hits"] / max(1.0, summary["cache_hits"] + summary["cache_misses"])
+        sample_summaries.append(summary)
+    _write_json_csv(
+        sample_summaries,
+        output_dir / "decode_sample_context_summary.json",
+        output_dir / "decode_sample_context_summary.csv",
+    )
+
+    context_groups: dict[int, list[dict[str, object]]] = defaultdict(list)
+    for summary in sample_summaries:
+        context_groups[int(summary["requested_context_length"])].append(summary)
+    summaries: list[dict[str, object]] = []
+    for context, rows in sorted(context_groups.items()):
+        if len({int(row["measured_start_kv_length"]) for row in rows}) != 1:
+            raise AssertionError("sample summaries disagree on measured start KV length")
+        if len({int(row["measured_end_kv_length"]) for row in rows}) != 1:
+            raise AssertionError("sample summaries disagree on measured end KV length")
+        summary: dict[str, object] = {
+            "requested_context_length": context,
+            "measured_start_kv_length": rows[0]["measured_start_kv_length"],
+            "measured_end_kv_length": rows[0]["measured_end_kv_length"],
+            "num_samples": len(rows),
+        }
+        for field in NUMERIC_RESULT_FIELDS:
+            values = [float(row[field]) for row in rows]
+            summary[field] = mean(values)
+            summary[f"{field}_std"] = pstdev(values)
+        hit_rates = [float(row["hit_rate"]) for row in rows]
+        summary["hit_rate"] = mean(hit_rates)
+        summary["hit_rate_std"] = pstdev(hit_rates)
         summaries.append(summary)
-    with (output_dir / "decode_summary.json").open("w") as handle:
-        json.dump(summaries, handle, indent=2)
-    with (output_dir / "decode_summary.csv").open("w", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(summaries[0].keys()))
-        writer.writeheader()
-        writer.writerows(summaries)
+    _write_json_csv(summaries, output_dir / "decode_summary.json", output_dir / "decode_summary.csv")
 
     print()
     print(
-        "Requested | Measured KV Range | KV GiB | Cache Capacity Slots | Resident Slots | "
+        "Requested | Samples | Measured KV Range | KV GiB | Cache Capacity Slots | Resident Slots | "
         "Cache Allocated GiB | Cache Resident GiB | Hit Rate | Accesses/token | H2D GB/token | "
         "Host Staging ms | Attention ms | Router ms | H2D ms | Expert Compute ms | Other ms | TPOT ms"
     )
     for row in summaries:
         print(
             f"{int(row['requested_context_length']):9d} | "
+            f"{int(row['num_samples']):7d} | "
             f"{int(row['measured_start_kv_length']):5d}->{int(row['measured_end_kv_length']):5d} | "
             f"{row['kv_cache_bytes'] / 1024**3:6.2f} | "
             f"{row['expert_cache_capacity_slots']:20.1f} | "
@@ -484,19 +546,68 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default=MODEL)
     parser.add_argument("--contexts", nargs="+", type=int, default=list(DEFAULT_CONTEXTS))
-    parser.add_argument("--warmup-tokens", type=int, default=4)
-    parser.add_argument("--measure-tokens", type=int, default=32)
+    parser.add_argument("--warmup-tokens", type=int, default=DEFAULT_WARMUP_TOKENS)
+    parser.add_argument("--measure-tokens", type=int, default=DEFAULT_MEASURE_TOKENS)
+    parser.add_argument("--num-samples", type=int, default=1)
+    parser.add_argument("--sample-seed", type=int, default=42)
     parser.add_argument("--gpu-budget-gib", type=float, default=GPU_BUDGET_GIB)
     parser.add_argument("--runtime-reserve-gib", type=float, default=RUNTIME_RESERVE_GIB)
     parser.add_argument("--output-dir", type=Path, default=Path("results/decode_latency"))
     args = parser.parse_args()
 
+    if not args.contexts:
+        raise ValueError("at least one context length is required")
+    if max(args.contexts) > 32768:
+        raise ValueError("requested context exceeds Mixtral's native 32768-token context window")
+    longest_prefill_length = max(args.contexts) - args.measure_tokens - args.warmup_tokens
+    if longest_prefill_length < 1:
+        raise ValueError("warmup and measured tokens leave no prefill tokens")
+    selection_prompt_length = max(longest_prefill_length, SAMPLE_SELECTION_PROMPT_LENGTH)
+
+    print(f"Loading Mixtral tokenizer: {args.model}")
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    samples = load_deterministic_samples(
+        tokenizer,
+        num_samples=args.num_samples,
+        sample_seed=args.sample_seed,
+        required_prompt_length=selection_prompt_length,
+    )
+    print(f"LongBench v2 samples (seed={args.sample_seed}): {[sample.sample_id for sample in samples]}")
+
     benchmark = DecodeBenchmark(args.model, args.gpu_budget_gib, args.runtime_reserve_gib)
     all_results: list[TokenResult] = []
-    for context_length in args.contexts:
-        print(f"Running context length {context_length}")
-        all_results.extend(benchmark.run_context(context_length, args.warmup_tokens, args.measure_tokens))
-    save_results(all_results, args.output_dir)
+    for sample in samples:
+        for context_length in args.contexts:
+            prefill_length = context_length - args.measure_tokens - args.warmup_tokens
+            prompt_input_ids = build_prompt_input_ids(tokenizer, sample, prefill_length)
+            repeated_input_ids = build_prompt_input_ids(tokenizer, sample, prefill_length)
+            if not torch.equal(prompt_input_ids, repeated_input_ids):
+                raise AssertionError(f"prompt construction is not deterministic for sample {sample.sample_id}")
+            if prompt_input_ids.shape[-1] != prefill_length:
+                raise AssertionError(
+                    f"input_ids length {prompt_input_ids.shape[-1]} does not equal {prefill_length}"
+                )
+            print(f"Running sample {sample.sample_id}, context length {context_length}")
+            all_results.extend(
+                benchmark.run_context(
+                    sample.sample_id,
+                    context_length,
+                    args.warmup_tokens,
+                    args.measure_tokens,
+                    prompt_input_ids,
+                )
+            )
+    metadata = {
+        "model": args.model,
+        "dataset": DATASET_NAME,
+        "sample_seed": args.sample_seed,
+        "sample_ids": [sample.sample_id for sample in samples],
+        "contexts": args.contexts,
+        "warmup_tokens": args.warmup_tokens,
+        "measure_tokens": args.measure_tokens,
+        "sample_selection_prompt_length": selection_prompt_length,
+    }
+    save_results(all_results, args.output_dir, metadata)
 
 
 if __name__ == "__main__":
