@@ -725,10 +725,13 @@ def main() -> None:
     parser.add_argument("--gpu-budget-gib", type=float, default=GPU_BUDGET_GIB)
     parser.add_argument("--runtime-reserve-gib", type=float, default=RUNTIME_RESERVE_GIB)
     parser.add_argument("--output-dir", type=Path, default=Path("results/decode_latency"))
+    parser.add_argument("--cpu-threads", type=int, default=8)
+
     args = parser.parse_args()
 
-    torch.set_num_threads(8)
-
+    torch.set_num_threads(args.cpu_threads)
+    print(f"PyTorch CPU threads: {torch.get_num_threads()}")
+    
     if not args.contexts:
         raise ValueError("at least one context length is required")
     if max(args.contexts) > 32768:
