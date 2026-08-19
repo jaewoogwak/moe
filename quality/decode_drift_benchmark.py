@@ -13,10 +13,8 @@ import csv
 import json
 import math
 import os
-import shutil
 import subprocess
 import sys
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -46,6 +44,8 @@ TOKEN_FIELDS = (
     "q_nll",
     "delta_nll",
     "routing_drift_mean",
+    "router_logit_rel_l2_mean",
+    "router_logit_cosine_distance_mean",
     "hidden_rel_l2_mean",
     "hidden_cosine_distance_mean",
     "logit_kl",
@@ -61,6 +61,8 @@ LAYER_FIELDS = (
     "q_top1",
     "q_top2",
     "router_margin_fp",
+    "router_logit_rel_l2",
+    "router_logit_cosine_distance",
     "hidden_rel_l2",
     "hidden_cosine_distance",
 )
@@ -71,6 +73,7 @@ class RouterTrace:
     top1: int
     top2: int
     margin: float
+    logits_cpu: torch.Tensor
 
 
 @dataclass
@@ -114,6 +117,7 @@ class TraceHooks:
                 top1=int(top_indices[0].item()),
                 top2=int(top_indices[1].item()),
                 margin=float((ordered_logits[1] - ordered_logits[2]).item()),
+                logits_cpu=logits.detach().to(device="cpu", dtype=torch.float32).clone(),
             )
 
         return hook
@@ -171,6 +175,32 @@ def snapshot_dynamic_cache(cache: DynamicCache) -> tuple[tuple[torch.Tensor, tor
     return tuple(snapshot)
 
 
+def snapshot_to_cpu(
+    snapshot: tuple[tuple[torch.Tensor, torch.Tensor], ...],
+) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
+    """Move an immutable BF16 KV snapshot to CPU for sample checkpointing."""
+    return tuple(
+        (
+            keys.detach().to(device="cpu", dtype=torch.bfloat16).clone(),
+            values.detach().to(device="cpu", dtype=torch.bfloat16).clone(),
+        )
+        for keys, values in snapshot
+    )
+
+
+def snapshot_to_cuda(
+    snapshot: tuple[tuple[torch.Tensor, torch.Tensor], ...],
+) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
+    """Upload a checkpointed BF16 KV snapshot before DynamicCache restoration."""
+    return tuple(
+        (
+            keys.to(device="cuda", non_blocking=True),
+            values.to(device="cuda", non_blocking=True),
+        )
+        for keys, values in snapshot
+    )
+
+
 def restore_dynamic_cache(
     config: transformers.PretrainedConfig,
     snapshot: tuple[tuple[torch.Tensor, torch.Tensor], ...],
@@ -220,6 +250,14 @@ def _route_drift(fp: RouterTrace, q: RouterTrace) -> float:
     return 1.0 - len({fp.top1, fp.top2}.intersection({q.top1, q.top2})) / 2.0
 
 
+def _router_logit_divergence(fp: RouterTrace, q: RouterTrace) -> tuple[float, float]:
+    fp_logits = fp.logits_cpu.float()
+    q_logits = q.logits_cpu.float()
+    relative_l2 = torch.linalg.vector_norm(q_logits - fp_logits) / torch.linalg.vector_norm(fp_logits).clamp_min(1e-12)
+    cosine_distance = 1.0 - F.cosine_similarity(fp_logits, q_logits, dim=0, eps=1e-12)
+    return float(relative_l2.item()), max(0.0, float(cosine_distance.item()))
+
+
 def _assert_finite(logits: torch.Tensor, label: str) -> None:
     if not torch.isfinite(logits).all():
         raise FloatingPointError(f"NaN/Inf logits during {label}")
@@ -232,6 +270,65 @@ def _atomic_json(path: Path, value: object) -> None:
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(temporary, path)
+
+
+def save_fp_checkpoint(
+    path: Path,
+    snapshot: tuple[tuple[torch.Tensor, torch.Tensor], ...],
+    fp_trace: list[FPTokenTrace],
+) -> None:
+    """Atomically persist BF16-only state needed for the later Q phase."""
+    payload = {
+        "snapshot": snapshot_to_cpu(snapshot),
+        "fp_trace": [
+            {
+                "nll": token.nll,
+                "logits_cpu": token.logits_cpu,
+                "routes": [
+                    {
+                        "top1": route.top1,
+                        "top2": route.top2,
+                        "margin": route.margin,
+                        "logits_cpu": route.logits_cpu,
+                    }
+                    for route in token.step.routes
+                ],
+                "hidden": token.step.hidden,
+            }
+            for token in fp_trace
+        ],
+    }
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, temporary)
+    with temporary.open("rb") as handle:
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+
+
+def load_fp_checkpoint(
+    path: Path,
+) -> tuple[tuple[tuple[torch.Tensor, torch.Tensor], ...], list[FPTokenTrace]]:
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    snapshot = tuple((keys, values) for keys, values in payload["snapshot"])
+    trace: list[FPTokenTrace] = []
+    for token in payload["fp_trace"]:
+        routes = [
+            RouterTrace(
+                top1=int(route["top1"]),
+                top2=int(route["top2"]),
+                margin=float(route["margin"]),
+                logits_cpu=route["logits_cpu"],
+            )
+            for route in token["routes"]
+        ]
+        trace.append(
+            FPTokenTrace(
+                nll=float(token["nll"]),
+                logits_cpu=token["logits_cpu"],
+                step=StepTrace(routes=routes, hidden=list(token["hidden"])),
+            )
+        )
+    return snapshot, trace
 
 
 class SampleCSVWriter:
@@ -299,6 +396,8 @@ def _summary_rows(token_path: Path) -> list[dict[str, object]]:
                 "mean_delta_nll": mean_delta_nll,
                 "ppl_ratio": math.exp(mean_delta_nll),
                 "mean_routing_drift": average("routing_drift_mean"),
+                "mean_router_logit_rel_l2": average("router_logit_rel_l2_mean"),
+                "mean_router_logit_cosine_distance": average("router_logit_cosine_distance_mean"),
                 "mean_hidden_rel_l2": average("hidden_rel_l2_mean"),
                 "mean_logit_kl": average("logit_kl"),
             }
@@ -418,15 +517,25 @@ class QualityRuntime:
         sample_id: str,
         quant_bits: int,
         sequence: torch.Tensor,
-        snapshot: tuple[tuple[torch.Tensor, torch.Tensor], ...],
+        snapshot_cpu: tuple[tuple[torch.Tensor, torch.Tensor], ...],
         prefill_tokens: int,
         fp_trace: list[FPTokenTrace],
         hidden_stride: int,
         token_writer: SampleCSVWriter,
         layer_writer: SampleCSVWriter,
-    ) -> None:
+    ) -> dict[str, float]:
+        snapshot = snapshot_to_cuda(snapshot_cpu)
         cache = restore_dynamic_cache(self.model.config, snapshot)
+        if cache.get_seq_length() != prefill_tokens:
+            raise AssertionError("quantized trajectory did not restore the BF16 prefill KV length")
         self.cache.clear()  # Discard all BF16 cache residency before the Q trajectory.
+        maximums = {
+            "abs_delta_nll": 0.0,
+            "routing_drift": 0.0,
+            "router_logit_rel_l2": 0.0,
+            "hidden_rel_l2": 0.0,
+            "logit_kl": 0.0,
+        }
         for position, fp in enumerate(fp_trace, start=1):
             input_ids = sequence[:, prefill_tokens + position - 1 : prefill_tokens + position].to("cuda")
             target = sequence[:, prefill_tokens + position].to("cuda")
@@ -439,12 +548,30 @@ class QualityRuntime:
             _assert_finite(q_logits, f"quantized decode position {position}")
             q_nll = _nll(q_logits, target)
             route_drifts: list[float] = []
+            router_logit_l2: list[float] = []
+            router_logit_cosine: list[float] = []
             hidden_l2: list[float] = []
             hidden_cosine: list[float] = []
             for layer_id, (fp_route, q_route) in enumerate(zip(fp.step.routes, q_step.routes)):
                 route_drift = _route_drift(fp_route, q_route)
+                router_rel_l2, router_cosine_distance = _router_logit_divergence(fp_route, q_route)
+                if layer_id == 0 and route_drift != 0.0:
+                    raise AssertionError(
+                        "layer-0 routing drift must be exactly zero for expert-only quantization: "
+                        f"sample_id={sample_id}, decode_position={position}, "
+                        f"fp_top2=({fp_route.top1}, {fp_route.top2}), "
+                        f"q_top2=({q_route.top1}, {q_route.top2})"
+                    )
+                if layer_id == 0 and router_rel_l2 > 1e-7:
+                    raise AssertionError(
+                        "layer-0 router logits must be unchanged for expert-only quantization: "
+                        f"sample_id={sample_id}, decode_position={position}, "
+                        f"relative_l2={router_rel_l2:.3e}"
+                    )
                 rel_l2, cosine_distance = _hidden_divergence(fp.step.hidden[layer_id], q_step.hidden[layer_id])
                 route_drifts.append(route_drift)
+                router_logit_l2.append(router_rel_l2)
+                router_logit_cosine.append(router_cosine_distance)
                 if not math.isnan(rel_l2):
                     hidden_l2.append(rel_l2)
                     hidden_cosine.append(cosine_distance)
@@ -460,10 +587,21 @@ class QualityRuntime:
                         "q_top1": q_route.top1,
                         "q_top2": q_route.top2,
                         "router_margin_fp": fp_route.margin,
+                        "router_logit_rel_l2": router_rel_l2,
+                        "router_logit_cosine_distance": router_cosine_distance,
                         "hidden_rel_l2": rel_l2,
                         "hidden_cosine_distance": cosine_distance,
                     }
                 )
+            logit_kl = _logit_kl(fp.logits_cpu, q_logits[0])
+            delta_nll = q_nll - fp.nll
+            maximums["abs_delta_nll"] = max(maximums["abs_delta_nll"], abs(delta_nll))
+            maximums["routing_drift"] = max(maximums["routing_drift"], max(route_drifts))
+            maximums["router_logit_rel_l2"] = max(maximums["router_logit_rel_l2"], max(router_logit_l2))
+            maximums["hidden_rel_l2"] = max(
+                maximums["hidden_rel_l2"], max(hidden_l2) if hidden_l2 else 0.0
+            )
+            maximums["logit_kl"] = max(maximums["logit_kl"], abs(logit_kl))
             token_writer.write(
                 {
                     "sample_id": sample_id,
@@ -471,13 +609,20 @@ class QualityRuntime:
                     "decode_position": position,
                     "fp_nll": fp.nll,
                     "q_nll": q_nll,
-                    "delta_nll": q_nll - fp.nll,
+                    "delta_nll": delta_nll,
                     "routing_drift_mean": sum(route_drifts) / len(route_drifts),
+                    "router_logit_rel_l2_mean": sum(router_logit_l2) / len(router_logit_l2),
+                    "router_logit_cosine_distance_mean": sum(router_logit_cosine) / len(router_logit_cosine),
                     "hidden_rel_l2_mean": sum(hidden_l2) / len(hidden_l2) if hidden_l2 else math.nan,
                     "hidden_cosine_distance_mean": sum(hidden_cosine) / len(hidden_cosine) if hidden_cosine else math.nan,
-                    "logit_kl": _logit_kl(fp.logits_cpu, q_logits[0]),
+                    "logit_kl": logit_kl,
                 }
             )
+            if cache.get_seq_length() != prefill_tokens + position:
+                raise AssertionError(
+                    f"quantized KV length {cache.get_seq_length()} does not equal {prefill_tokens + position}"
+                )
+        return maximums
 
 
 def parse_args() -> argparse.Namespace:
@@ -508,6 +653,65 @@ def _git_commit() -> str:
         return "unknown"
 
 
+RESUME_FIELDS = (
+    "model_path",
+    "quant_bits",
+    "group_size",
+    "prefill_tokens",
+    "decode_tokens",
+    "dataset",
+    "dataset_split",
+    "sample_seed",
+    "hidden_stride",
+    "cache_slots",
+)
+
+
+def experiment_config(args: argparse.Namespace) -> dict[str, object]:
+    return {
+        "model_path": args.model,
+        "quant_bits": args.quant_bits,
+        "group_size": args.group_size,
+        "prefill_tokens": args.prefill_tokens,
+        "decode_tokens": args.decode_tokens,
+        "dataset": args.dataset,
+        "dataset_split": args.dataset_split,
+        "sample_seed": args.sample_seed,
+        "hidden_stride": args.hidden_stride,
+        "cache_slots": args.cache_slots,
+    }
+
+
+def validate_resume_metadata(metadata: dict[str, Any], args: argparse.Namespace) -> None:
+    expected = experiment_config(args)
+    if metadata.get("quality_drift_version") != 2:
+        raise ValueError(
+            "output directory contains results from an older/incompatible quality benchmark; "
+            "choose a new --output-dir"
+        )
+    for field in RESUME_FIELDS:
+        if metadata.get(field) != expected[field]:
+            raise ValueError(
+                f"cannot resume mixed experiment in {args.output_dir}: "
+                f"metadata {field}={metadata.get(field)!r}, requested {expected[field]!r}"
+            )
+
+
+def assert_bf16_sanity(maximums: dict[str, float], sample_id: str) -> None:
+    tolerances = {
+        "abs_delta_nll": 1e-6,
+        "routing_drift": 0.0,
+        "router_logit_rel_l2": 1e-7,
+        "hidden_rel_l2": 1e-7,
+        "logit_kl": 1e-6,
+    }
+    for field, tolerance in tolerances.items():
+        if maximums[field] > tolerance:
+            raise AssertionError(
+                f"BF16 sanity failed for {sample_id}: {field}={maximums[field]:.3e} exceeds {tolerance:.3e}"
+            )
+
+
 def main() -> None:
     args = parse_args()
     if args.prefill_tokens + args.decode_tokens + 1 > 32768:
@@ -525,27 +729,19 @@ def main() -> None:
     metadata_path = args.output_dir / "metadata.json"
     if metadata_path.exists():
         metadata: dict[str, Any] = json.loads(metadata_path.read_text())
-        completed: list[dict[str, Any]] = list(metadata.get("completed_samples", []))
+        validate_resume_metadata(metadata, args)
     else:
-        completed = []
         metadata = {
-            "model_path": args.model,
+            "quality_drift_version": 2,
             "git_commit": _git_commit(),
             "torch_version": torch.__version__,
             "transformers_version": transformers.__version__,
             "cuda_version": torch.version.cuda,
             "quantization_method": "groupwise_symmetric_rtn_fake_quant_bf16_reconstruction",
-            "quant_bits": args.quant_bits,
-            "group_size": args.group_size,
-            "prefill_tokens": args.prefill_tokens,
-            "decode_tokens": args.decode_tokens,
-            "dataset": args.dataset,
-            "dataset_split": args.dataset_split,
-            "sample_seed": args.sample_seed,
-            "hidden_stride": args.hidden_stride,
-            "completed_samples": completed,
+            **experiment_config(args),
+            "bf16_completed_samples": [],
+            "quantized_completed_samples": [],
         }
-    completed_ids = {str(row["sample_id"]) for row in completed}
 
     print(f"Loading tokenizer: {args.model}")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
@@ -558,14 +754,22 @@ def main() -> None:
         split=args.dataset_split,
         max_scan=args.dataset_max_scan,
     )
-    metadata["sample_ids"] = [sample.sample_id for sample in samples]
+    sample_ids = [sample.sample_id for sample in samples]
+    existing_sample_ids = metadata.get("sample_ids")
+    if existing_sample_ids is not None and existing_sample_ids != sample_ids:
+        raise ValueError("deterministic sample selection differs from existing output metadata")
+    metadata["sample_ids"] = sample_ids
     print(f"PG-19 samples (seed={args.sample_seed}): {metadata['sample_ids']}")
 
     runtime = QualityRuntime(args.model, args.cache_slots)
     try:
+        # Phase 1: every selected sample gets BF16 prefill and BF16 trace
+        # before the shared HostExpertStore is ever quantized.
+        bf16_completed: list[dict[str, Any]] = list(metadata.get("bf16_completed_samples", []))
+        bf16_ids = {str(row["sample_id"]) for row in bf16_completed}
         for sample_index, sample in enumerate(samples):
-            if sample.sample_id in completed_ids:
-                print(f"Skipping completed sample: {sample.sample_id}")
+            if sample.sample_id in bf16_ids:
+                print(f"Skipping completed BF16 phase: {sample.sample_id}")
                 continue
             sequence = sample.input_ids
             snapshot = runtime.prefill_snapshot(sequence[:, : args.prefill_tokens])
@@ -582,11 +786,35 @@ def main() -> None:
             fp_trace = runtime.collect_fp_trace(
                 sequence, snapshot, args.prefill_tokens, args.decode_tokens, args.hidden_stride
             )
+            fp_path = checkpoints / f"sample_{sample_index:04d}_bf16.pt"
+            save_fp_checkpoint(fp_path, snapshot, fp_trace)
+            bf16_completed.append(
+                {
+                    "sample_id": sample.sample_id,
+                    "sample_index": sample_index,
+                    "fp_checkpoint": str(fp_path.relative_to(args.output_dir)),
+                    "prefill_kv_length": args.prefill_tokens,
+                }
+            )
+            bf16_ids.add(sample.sample_id)
+            metadata["bf16_completed_samples"] = bf16_completed
+            _atomic_json(metadata_path, metadata)
+            print(f"Checkpointed BF16 phase for {sample.sample_id}")
+            del fp_trace, snapshot
+
+        if len(bf16_completed) != len(samples):
+            raise AssertionError("quantized phase cannot start before all BF16 sample traces are complete")
+
+        # Phase 2 uses the same model instance. Quantize exactly once after all
+        # BF16 snapshots/traces exist, then restore each sample's own BF16 KV.
+        quantized_completed: list[dict[str, Any]] = list(metadata.get("quantized_completed_samples", []))
+        quantized_ids = {str(row["sample_id"]) for row in quantized_completed}
+        if len(quantized_ids) < len(samples):
             if args.quant_bits == 16:
                 quant_stats = QuantizationStats()
                 print("Quantization condition: BF16 reference (no weight perturbation)")
             else:
-                print(f"Fake-quantizing all pinned experts to W{args.quant_bits}A16")
+                print(f"Fake-quantizing all pinned experts once to W{args.quant_bits}A16")
                 quant_stats = fake_quantize_expert_store_(
                     runtime.store,
                     bits=args.quant_bits,
@@ -594,18 +822,27 @@ def main() -> None:
                     row_chunk_size=args.quant_row_chunk_size,
                 )
                 print("Quantization stats:", quant_stats.as_dict())
-            runtime.cache.clear()
+            metadata["quantization_stats"] = quant_stats.as_dict()
+            _atomic_json(metadata_path, metadata)
 
+        for sample_index, sample in enumerate(samples):
+            if sample.sample_id in quantized_ids:
+                print(f"Skipping completed quantized phase: {sample.sample_id}")
+                continue
+            fp_record = next(row for row in bf16_completed if row["sample_id"] == sample.sample_id)
+            snapshot_cpu, fp_trace = load_fp_checkpoint(args.output_dir / fp_record["fp_checkpoint"])
+            if len(fp_trace) != args.decode_tokens:
+                raise AssertionError("FP checkpoint decode length differs from current experiment")
             token_path = checkpoints / f"sample_{sample_index:04d}_tokens.csv"
             layer_path = checkpoints / f"sample_{sample_index:04d}_layers.csv"
             token_writer = SampleCSVWriter(token_path, TOKEN_FIELDS)
             layer_writer = SampleCSVWriter(layer_path, LAYER_FIELDS)
             try:
-                runtime.collect_quantized_rows(
+                maximums = runtime.collect_quantized_rows(
                     sample_id=sample.sample_id,
                     quant_bits=args.quant_bits,
-                    sequence=sequence,
-                    snapshot=snapshot,
+                    sequence=sample.input_ids,
+                    snapshot_cpu=snapshot_cpu,
                     prefill_tokens=args.prefill_tokens,
                     fp_trace=fp_trace,
                     hidden_stride=args.hidden_stride,
@@ -618,31 +855,33 @@ def main() -> None:
                 token_writer.abort()
                 layer_writer.abort()
                 raise
-
-            completed.append(
+            if args.quant_bits == 16:
+                assert_bf16_sanity(maximums, sample.sample_id)
+            quantized_completed.append(
                 {
                     "sample_id": sample.sample_id,
                     "sample_index": sample_index,
                     "token_checkpoint": str(token_path.relative_to(args.output_dir)),
                     "layer_checkpoint": str(layer_path.relative_to(args.output_dir)),
-                    "quantization_stats": quant_stats.as_dict(),
+                    "trajectory_maximums": maximums,
                 }
             )
-            completed_ids.add(sample.sample_id)
+            quantized_ids.add(sample.sample_id)
             _rebuild_combined_csv(
                 args.output_dir / "token_metrics.csv",
-                [args.output_dir / row["token_checkpoint"] for row in completed],
+                [args.output_dir / row["token_checkpoint"] for row in quantized_completed],
                 TOKEN_FIELDS,
             )
             _rebuild_combined_csv(
                 args.output_dir / "layer_metrics.csv",
-                [args.output_dir / row["layer_checkpoint"] for row in completed],
+                [args.output_dir / row["layer_checkpoint"] for row in quantized_completed],
                 LAYER_FIELDS,
             )
             _write_summary(args.output_dir)
-            metadata["completed_samples"] = completed
+            metadata["quantized_completed_samples"] = quantized_completed
             _atomic_json(metadata_path, metadata)
-            print(f"Checkpointed quality sample {sample.sample_id}")
+            print(f"Checkpointed quantized phase for {sample.sample_id}")
+            del snapshot_cpu, fp_trace
     finally:
         runtime.hooks.close()
 

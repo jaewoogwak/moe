@@ -164,6 +164,13 @@ def main() -> None:
         output=args.output_dir / "hidden_rel_l2.png",
     )
     line_plot(
+        per_position_mean(token_rows, "router_logit_rel_l2_mean"),
+        window=args.window,
+        ylabel="Mean router-logit relative L2",
+        title="Decode Position vs Router-Logit Divergence",
+        output=args.output_dir / "router_logit_rel_l2.png",
+    )
+    line_plot(
         per_position_mean(token_rows, "logit_kl"),
         window=args.window,
         ylabel="KL(p_FP || p_Q)",
