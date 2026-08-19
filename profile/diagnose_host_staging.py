@@ -21,6 +21,7 @@ from offload.host_expert_store import HostExpertStore
 
 
 DEFAULT_MODEL = "/workspace/models/Mixtral-8x7B-Instruct-v0.1"
+DEFAULT_THREAD_SWEEP = (1, 2, 4, 8, 16, 32, 64, 128)
 
 
 @dataclass(frozen=True)
@@ -149,6 +150,48 @@ def print_result(result: CopyResult) -> None:
     )
 
 
+def run_cpu_thread_sweep(
+    thread_counts: list[int],
+    source: tuple[torch.Tensor, torch.Tensor],
+    pageable_destination: tuple[torch.Tensor, torch.Tensor],
+    pinned_source: tuple[torch.Tensor, torch.Tensor],
+    pinned_destination: tuple[torch.Tensor, torch.Tensor],
+    warmup: int,
+    repeat: int,
+) -> list[tuple[int, CopyResult, CopyResult]]:
+    results: list[tuple[int, CopyResult, CopyResult]] = []
+    for thread_count in thread_counts:
+        torch.set_num_threads(thread_count)
+        pageable_to_pageable = benchmark_cpu_copy(
+            "pageable -> pageable", source, pageable_destination, warmup, repeat
+        )
+        pinned_to_pinned = benchmark_cpu_copy(
+            "pinned -> pinned", pinned_source, pinned_destination, warmup, repeat
+        )
+        results.append((thread_count, pageable_to_pageable, pinned_to_pinned))
+    return results
+
+
+def print_thread_sweep(
+    results: list[tuple[int, CopyResult, CopyResult]], current_default: int
+) -> None:
+    print("\nCPU thread sweep details")
+    for thread_count, pageable_to_pageable, pinned_to_pinned in results:
+        label = f"{thread_count} (current_default)" if thread_count == current_default else str(thread_count)
+        print(f"threads={label}")
+        print_result(pageable_to_pageable)
+        print_result(pinned_to_pinned)
+
+    print("\nCompact comparison")
+    print("threads | pageable->pageable GB/s | pinned->pinned GB/s")
+    for thread_count, pageable_to_pageable, pinned_to_pinned in results:
+        label = f"{thread_count} (default)" if thread_count == current_default else str(thread_count)
+        print(
+            f"{label:21s} | {pageable_to_pageable.bandwidth_gbps:24.2f} | "
+            f"{pinned_to_pinned.bandwidth_gbps:20.2f}"
+        )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=DEFAULT_MODEL)
@@ -156,15 +199,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--expert", type=int, default=0)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--repeat", type=int, default=20)
+    parser.add_argument(
+        "--threads",
+        type=int,
+        nargs="+",
+        default=list(DEFAULT_THREAD_SWEEP),
+        help="CPU thread counts to sweep; the initial PyTorch default is always included.",
+    )
+    parser.add_argument("--skip-h2d", action="store_true", help="Skip the one pinned-to-GPU measurement.")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    if not torch.cuda.is_available():
+    if not args.skip_h2d and not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for the pinned -> GPU diagnostic")
     if args.warmup < 0 or args.repeat < 1:
         raise ValueError("--warmup must be non-negative and --repeat must be positive")
+    if any(thread_count < 1 for thread_count in args.threads):
+        raise ValueError("--threads values must be positive")
+    current_default_threads = torch.get_num_threads()
+    thread_counts = list(dict.fromkeys(args.threads))
+    if current_default_threads not in thread_counts:
+        thread_counts.append(current_default_threads)
 
     print(f"Loading Mixtral on CPU: {args.model}")
     model = AutoModelForCausalLM.from_pretrained(
@@ -192,31 +249,37 @@ def main() -> None:
     pinned_source = (empty_like_cpu(gate_up, pinned=True), empty_like_cpu(down, pinned=True))
     pinned_source[0].copy_(gate_up)
     pinned_source[1].copy_(down)
-    gpu_destination = (
-        torch.empty_like(gate_up, device="cuda"),
-        torch.empty_like(down, device="cuda"),
-    )
+    gpu_destination = None
+    if not args.skip_h2d:
+        gpu_destination = (
+            torch.empty_like(gate_up, device="cuda"),
+            torch.empty_like(down, device="cuda"),
+        )
 
     with torch.inference_mode():
-        results = [
-            benchmark_cpu_copy(
-                "pageable -> pinned", source, pinned_destination, args.warmup, args.repeat
-            ),
-            benchmark_cpu_copy(
-                "pageable -> pageable", source, pageable_destination, args.warmup, args.repeat
-            ),
-            benchmark_cpu_copy(
-                "pinned -> pinned", pinned_source, pinned_destination, args.warmup, args.repeat
-            ),
-            benchmark_pinned_h2d(pinned_source, gpu_destination, args.warmup, args.repeat),
-        ]
+        try:
+            results = run_cpu_thread_sweep(
+                thread_counts,
+                source,
+                pageable_destination,
+                pinned_source,
+                pinned_destination,
+                args.warmup,
+                args.repeat,
+            )
+        finally:
+            torch.set_num_threads(current_default_threads)
 
-    print("\nDetailed results")
-    for result in results:
-        print_result(result)
-    print("\nConcise comparison")
-    for result in results:
-        print(f"{result.name:22s}: {result.mean_ms:.2f} ms, {result.bandwidth_gbps:.2f} GB/s")
+        h2d_result = None
+        if gpu_destination is not None:
+            h2d_result = benchmark_pinned_h2d(
+                pinned_source, gpu_destination, args.warmup, args.repeat
+            )
+
+    print_thread_sweep(results, current_default_threads)
+    if h2d_result is not None:
+        print("\nPinned-to-GPU diagnostic (not part of the CPU thread sweep)")
+        print_result(h2d_result)
 
 
 if __name__ == "__main__":
