@@ -1,1 +1,1 @@
-"""Dataset helpers for profiling experiments."""
+"""Dataset helpers for profiling and quality experiments."""
