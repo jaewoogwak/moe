@@ -162,24 +162,35 @@ class GPUExpertCache:
             self._free_slots = deque(range(self.capacity_slots))
 
     def set_capacity_slots(self, capacity_slots: int) -> None:
-        """Allocate exactly capacity_slots reusable CUDA expert slots."""
+        """Resize reusable CUDA slots in place without a duplicate full cache."""
         if capacity_slots < 1:
             raise ValueError("capacity_slots must be at least one")
-        if capacity_slots == self.capacity_slots:
+        current_capacity = self.capacity_slots
+        if capacity_slots == current_capacity:
             self.clear()
             return
 
-        # Resizing happens only outside measured decode. Existing tensors are
-        # released here; eviction during decode only remaps metadata.
-        self._entries.clear()
-        self._layer_counts.clear()
-        self._slots = [
-            (
-                torch.empty(self.GATE_UP_SHAPE, dtype=torch.bfloat16, device=self.device),
-                torch.empty(self.DOWN_SHAPE, dtype=torch.bfloat16, device=self.device),
+        # Resizing happens only outside measured decode. Discard residency but
+        # retain physical tensors that remain within the requested capacity.
+        if current_capacity:
+            self.clear()
+        if capacity_slots > current_capacity:
+            self._slots.extend(
+                (
+                    torch.empty(self.GATE_UP_SHAPE, dtype=torch.bfloat16, device=self.device),
+                    torch.empty(self.DOWN_SHAPE, dtype=torch.bfloat16, device=self.device),
+                )
+                for _ in range(capacity_slots - current_capacity)
             )
-            for _ in range(capacity_slots)
-        ]
+        else:
+            del self._slots[capacity_slots:]
+            # Tail tensors have no references after deletion. This is outside
+            # measured decode and returns cached allocator blocks before a
+            # later resize may require a large allocation.
+            torch.cuda.empty_cache()
+
+        if self.capacity_slots != capacity_slots:
+            raise AssertionError("in-place cache resize did not reach requested capacity")
         if self.cache_policy == FIXED_PER_LAYER_LRU:
             self._rebuild_fixed_per_layer_slots()
         else:
