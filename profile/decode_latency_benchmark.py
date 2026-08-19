@@ -727,6 +727,8 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, default=Path("results/decode_latency"))
     args = parser.parse_args()
 
+    torch.set_num_threads(8)
+
     if not args.contexts:
         raise ValueError("at least one context length is required")
     if max(args.contexts) > 32768:

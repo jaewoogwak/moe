@@ -40,6 +40,12 @@ def benchmark_h2d(
       - no separate copy stream
       - no overlap/prefetch
     """
+    
+    print("gate_up_cpu.device:  ", gate_up_cpu.device)
+    print("down_cpu.device:  ", down_cpu.device)
+    
+    print("gate_up_gpu.device:  ", gate_up_gpu.device)
+    print("down_gpu.device:  ", down_gpu.device)
 
     # Warmup
     for _ in range(warmup):
