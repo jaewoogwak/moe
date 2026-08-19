@@ -78,7 +78,7 @@ def main() -> None:
 
     axis.set_yticks(positions, labels)
     axis.set_xlabel("Latency per output token (ms)")
-    axis.set_title(args.title, pad=34, fontsize=13, weight="bold")
+    fig.suptitle(args.title, y=0.975, fontsize=13, weight="bold")
     axis.xaxis.set_major_locator(MultipleLocator(100))
     axis.xaxis.grid(True, color="#C9C9C9", linestyle="--", linewidth=0.8, alpha=0.8)
     axis.set_axisbelow(True)
@@ -89,7 +89,7 @@ def main() -> None:
     axis.legend(
         ncol=len(COMPONENTS),
         loc="upper center",
-        bbox_to_anchor=(0.5, 1.24),
+        bbox_to_anchor=(0.5, 1.28),
         frameon=False,
         fontsize=9,
         handlelength=1.25,
@@ -103,7 +103,7 @@ def main() -> None:
         fontsize=8.5,
         color="#555555",
     )
-    fig.subplots_adjust(left=0.13, right=0.95, top=0.77, bottom=0.16)
+    fig.subplots_adjust(left=0.13, right=0.95, top=0.70, bottom=0.16)
 
     args.output_png.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(args.output_png, dpi=220, bbox_inches="tight", facecolor="white")
