@@ -1,7 +1,9 @@
-"""CPU-resident storage for Mixtral expert weights.
+"""Pinned CPU storage for Mixtral expert weights.
 
-The store retains views into a CPU-loaded Hugging Face Mixtral model. It does
-not copy weights or move tensors between devices.
+The store owns one BF16 pinned copy of every expert. As each layer is copied,
+its pageable checkpoint expert parameters are released from the model. This
+keeps the steady-state host footprint to the pinned expert store rather than
+retaining a second pageable copy of all expert weights.
 """
 
 from __future__ import annotations
@@ -15,11 +17,7 @@ ExpertWeights = Tuple[torch.Tensor, torch.Tensor]
 
 
 class HostExpertStore:
-    """Index CPU-resident Mixtral expert weights by layer and expert ID.
-
-    The tensors stored here are views of the model parameters, so the model must
-    remain alive for as long as this store is used.
-    """
+    """Index pinned CPU Mixtral expert weights by layer and expert ID."""
 
     NUM_LAYERS = 32
     NUM_EXPERTS_PER_LAYER = 8
@@ -29,6 +27,7 @@ class HostExpertStore:
 
     def __init__(self, model: torch.nn.Module) -> None:
         self._experts: Dict[Tuple[int, int], ExpertWeights] = {}
+        self._pageable_expert_storage_released = False
         self._validate_model(model)
 
         for layer_id, layer in enumerate(model.model.layers):
@@ -37,18 +36,43 @@ class HostExpertStore:
             down_proj = experts.down_proj
 
             for expert_id in range(self.NUM_EXPERTS_PER_LAYER):
-                # Tensor indexing returns a view, so this does not duplicate
-                # checkpoint data.
+                # Allocate the final host representation directly. The copy
+                # preserves BF16 checkpoint bits exactly and is the only
+                # persistent expert copy retained after this layer is done.
+                source_gate_up = gate_up_proj[expert_id]
+                source_down = down_proj[expert_id]
+                pinned_gate_up = self._empty_pinned_like(source_gate_up)
+                pinned_down = self._empty_pinned_like(source_down)
+                pinned_gate_up.copy_(source_gate_up)
+                pinned_down.copy_(source_down)
                 self._experts[(layer_id, expert_id)] = (
-                    gate_up_proj[expert_id],
-                    down_proj[expert_id],
+                    pinned_gate_up,
+                    pinned_down,
                 )
+                del source_gate_up, source_down
+
+            # No inference is performed between HostExpertStore construction
+            # and expert-module replacement. Drop this layer's pageable expert
+            # parameters now, limiting the conversion peak to one layer rather
+            # than retaining an additional ~84 GiB checkpoint copy.
+            delattr(experts, "gate_up_proj")
+            delattr(experts, "down_proj")
 
         gate_up, down = self._experts[(0, 0)]
         self._expert_size_bytes = (gate_up.numel() + down.numel()) * gate_up.element_size()
+        self._pageable_expert_storage_released = True
+
+    @staticmethod
+    def _empty_pinned_like(tensor: torch.Tensor) -> torch.Tensor:
+        return torch.empty(
+            tensor.shape,
+            dtype=tensor.dtype,
+            device="cpu",
+            pin_memory=True,
+        )
 
     def get(self, layer_id: int, expert_id: int) -> ExpertWeights:
-        """Return the CPU BF16 gate-up and down-projection tensors for an expert."""
+        """Return the pinned CPU BF16 gate-up and down-projection tensors."""
         self._validate_indices(layer_id, expert_id)
         return self._experts[(layer_id, expert_id)]
 
@@ -63,6 +87,21 @@ class HostExpertStore:
     def total_size_bytes(self) -> int:
         """Return the total size of all stored expert weights in bytes."""
         return self.num_experts() * self.expert_size_bytes()
+
+    def all_experts_pinned(self) -> bool:
+        """Return whether every persistent expert tensor is CPU-pinned."""
+        return all(
+            gate_up.device.type == "cpu"
+            and down.device.type == "cpu"
+            and gate_up.is_pinned()
+            and down.is_pinned()
+            for gate_up, down in self._experts.values()
+        )
+
+    @property
+    def pageable_expert_storage_released(self) -> bool:
+        """Whether original model expert parameters were released layer by layer."""
+        return self._pageable_expert_storage_released
 
     @classmethod
     def _validate_indices(cls, layer_id: int, expert_id: int) -> None:

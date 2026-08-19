@@ -285,6 +285,7 @@ def validate_placement(model: torch.nn.Module, store: HostExpertStore) -> None:
             gate_up, down = store.get(layer_id, expert_id)
             assert gate_up.device.type == "cpu" and down.device.type == "cpu"
             assert gate_up.dtype == torch.bfloat16 and down.dtype == torch.bfloat16
+            assert gate_up.is_pinned() and down.is_pinned()
     assert model.model.embed_tokens.weight.device.type == "cuda"
     assert model.lm_head.weight.device.type == "cuda"
     for layer in model.model.layers:
@@ -392,6 +393,18 @@ class DecodeBenchmark:
         )
         replace_with_cached_offloaded_experts(self.model, self.expert_cache)
         validate_placement(self.model, self.host_store)
+        print(
+            "Pinned host experts: "
+            f"{self.host_store.total_size_bytes() / 1024**3:.2f} GiB "
+            f"({self.host_store.total_size_bytes():,} bytes)"
+        )
+        print(f"All host experts pinned: {self.host_store.all_experts_pinned()}")
+        print(f"PyTorch CPU threads: {torch.get_num_threads()}")
+        print(
+            "Original pageable expert storage released: "
+            f"{self.host_store.pageable_expert_storage_released} "
+            "(each source layer was dropped after its pinned copy completed)"
+        )
         self.non_expert_model_bytes = model_gpu_bytes(self.model)
         expected_accesses = self.model.config.num_hidden_layers * self.model.config.num_experts_per_tok
         self.profiler = TokenProfiler(self.expert_cache, expected_expert_accesses=expected_accesses)

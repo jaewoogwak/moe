@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 
 
 class OffloadedMixtralExperts(nn.Module):
-    """Naive single-buffer CPU-to-GPU expert executor."""
+    """Naive single-buffer executor using direct pinned-CPU-to-GPU copies."""
 
     GATE_UP_SHAPE = (28672, 4096)
     DOWN_SHAPE = (4096, 14336)
@@ -66,6 +66,8 @@ class OffloadedMixtralExperts(nn.Module):
             top_k_pos, token_idx = torch.where(expert_mask[expert_id])
             current_state = hidden_states[token_idx]
             gate_up_cpu, down_cpu = self.host_store.get(self.layer_id, expert_id)
+            if not gate_up_cpu.is_pinned() or not down_cpu.is_pinned():
+                raise AssertionError("OffloadedMixtralExperts requires pinned CPU expert weights")
             self.gate_up_buffer.copy_(gate_up_cpu, non_blocking=True)
             self.down_buffer.copy_(down_cpu, non_blocking=True)
             gate, up = F.linear(current_state, self.gate_up_buffer).chunk(2, dim=-1)

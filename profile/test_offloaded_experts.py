@@ -25,15 +25,12 @@ RTOL = 1e-2
 
 
 def reference_expert_output(
-    model: torch.nn.Module,
-    layer_id: int,
-    expert_id: int,
+    weights: tuple[torch.Tensor, torch.Tensor],
     hidden_states: torch.Tensor,
 ) -> torch.Tensor:
     """Run one original CPU expert after temporarily copying its weights to CUDA."""
-    original_experts = model.model.layers[layer_id].mlp.experts
-    gate_up_gpu = original_experts.gate_up_proj[expert_id].to("cuda")
-    down_gpu = original_experts.down_proj[expert_id].to("cuda")
+    gate_up_gpu = weights[0].to("cuda")
+    down_gpu = weights[1].to("cuda")
 
     gate, up = F.linear(hidden_states, gate_up_gpu).chunk(2, dim=-1)
     output = F.linear(F.silu(gate) * up, down_gpu)
@@ -85,7 +82,17 @@ def main() -> None:
         low_cpu_mem_usage=True,
     )
     model.eval()
+    # Keep only the selected original views for reference; HostExpertStore
+    # releases model-owned pageable expert parameters after making pinned copies.
+    reference_weights = {
+        (layer_id, expert_id): (
+            model.model.layers[layer_id].mlp.experts.gate_up_proj[expert_id],
+            model.model.layers[layer_id].mlp.experts.down_proj[expert_id],
+        )
+        for layer_id, expert_id in TEST_CASES
+    }
     store = HostExpertStore(model)
+    assert store.all_experts_pinned()
 
     # This is intentionally a standalone layer-0 executor; do not replace the
     # full model before expert-level correctness has been established.
@@ -101,7 +108,7 @@ def main() -> None:
             )
         executor = executors[layer_id]
 
-        reference = reference_expert_output(model, layer_id, expert_id, hidden_states)
+        reference = reference_expert_output(reference_weights[(layer_id, expert_id)], hidden_states)
         offloaded = routed_single_expert(executor, hidden_states, expert_id)
         torch.cuda.synchronize()
 

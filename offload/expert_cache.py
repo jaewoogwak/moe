@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections import Counter, OrderedDict, deque
 from dataclasses import dataclass
-from time import perf_counter
 from typing import TYPE_CHECKING, Deque, Tuple
 
 import torch
@@ -65,26 +64,10 @@ class GPUExpertCache:
         self._slots_by_layer: list[tuple[int, ...]] = []
 
         self._slots: list[GPUExpertWeights] = []
-        self._pinned_ready_event: torch.cuda.Event | None = None
         self._hits = 0
         self._misses = 0
         self._evictions = 0
         self._h2d_bytes = 0
-        self._host_staging_ms = 0.0
-
-        # There is exactly one shared pinned staging expert.
-        self.pinned_gate_up = torch.empty(
-            self.GATE_UP_SHAPE,
-            dtype=torch.bfloat16,
-            device="cpu",
-            pin_memory=True,
-        )
-        self.pinned_down = torch.empty(
-            self.DOWN_SHAPE,
-            dtype=torch.bfloat16,
-            device="cpu",
-            pin_memory=True,
-        )
         self.set_capacity_slots(capacity_slots)
 
     @property
@@ -138,7 +121,9 @@ class GPUExpertCache:
             misses=self._misses,
             evictions=self._evictions,
             h2d_bytes=self._h2d_bytes,
-            host_staging_ms=self._host_staging_ms,
+            # Retained for the existing CSV schema. Experts are already
+            # pinned, so there is no per-miss host staging operation.
+            host_staging_ms=0.0,
         )
 
     def reset_stats(self) -> None:
@@ -146,7 +131,6 @@ class GPUExpertCache:
         self._misses = 0
         self._evictions = 0
         self._h2d_bytes = 0
-        self._host_staging_ms = 0.0
 
     def clear(self) -> None:
         """Clear residency/LRU metadata while retaining all GPU slot tensors."""
@@ -211,25 +195,18 @@ class GPUExpertCache:
             return self._slots[slot_id]
 
         gate_up_cpu, down_cpu = self.host_store.get(layer_id, expert_id)
-        if self._pinned_ready_event is not None:
-            self._pinned_ready_event.synchronize()
-
-        staging_start = perf_counter()
-        self.pinned_gate_up.copy_(gate_up_cpu)
-        self.pinned_down.copy_(down_cpu)
-        self._host_staging_ms += (perf_counter() - staging_start) * 1000
+        if not gate_up_cpu.is_pinned() or not down_cpu.is_pinned():
+            raise AssertionError("GPU expert cache requires pinned CPU expert weights")
 
         gate_up_gpu, down_gpu = self._slots[self._pending_slot_id]
         if profiler is None:
-            gate_up_gpu.copy_(self.pinned_gate_up, non_blocking=True)
-            down_gpu.copy_(self.pinned_down, non_blocking=True)
+            gate_up_gpu.copy_(gate_up_cpu, non_blocking=True)
+            down_gpu.copy_(down_cpu, non_blocking=True)
         else:
             with profiler.cuda_section("expert_h2d"):
-                gate_up_gpu.copy_(self.pinned_gate_up, non_blocking=True)
-                down_gpu.copy_(self.pinned_down, non_blocking=True)
+                gate_up_gpu.copy_(gate_up_cpu, non_blocking=True)
+                down_gpu.copy_(down_cpu, non_blocking=True)
 
-        self._pinned_ready_event = torch.cuda.Event()
-        self._pinned_ready_event.record()
         self._install_pending_entry(layer_id, expert_id)
         self._h2d_bytes += self.expert_size_bytes
         return gate_up_gpu, down_gpu
