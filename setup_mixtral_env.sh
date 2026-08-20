@@ -2,137 +2,79 @@
 
 set -euo pipefail
 
-# ============================================================
-# Mixtral MoE Profiling Environment Setup
+# Recreate the Mixtral profiling environment from the checked-in locks.
 #
-# Target:
-#   - RTX 4090
-#   - CUDA-compatible PyTorch (cu126)
-#   - Python 3.11
-#   - Hugging Face Transformers / Accelerate
-#   - Profiling utilities
-# ============================================================
+# The locks were exported from /venv/mixtral on this server. They target
+# Linux x86_64 and CUDA 12.6 PyTorch wheels. This script never installs
+# unpinned "latest" packages.
 
 ENV_NAME="${ENV_NAME:-mixtral}"
-PYTHON_VERSION="${PYTHON_VERSION:-3.11}"
+RECREATE="${RECREATE:-0}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONDA_LOCK="${SCRIPT_DIR}/requirements/mixtral-conda-linux-64.explicit"
+PIP_LOCK="${SCRIPT_DIR}/requirements/mixtral-pip.lock"
+CONDA_SH="${CONDA_SH:-/opt/miniforge3/etc/profile.d/conda.sh}"
 
-echo "============================================================"
-echo "[1/8] System check"
-echo "============================================================"
-
-# ---- Git ----
-if ! command -v git >/dev/null 2>&1; then
-    echo "[ERROR] git is not installed."
+fail() {
+    echo "[ERROR] $*" >&2
     exit 1
-fi
-echo "[OK] $(git --version)"
+}
 
-# ---- Conda ----
-if ! command -v conda >/dev/null 2>&1; then
-    echo "[ERROR] conda is not installed or not in PATH."
-    exit 1
-fi
-echo "[OK] conda: $(conda --version)"
+[[ "$(uname -s)" == "Linux" ]] || fail "This lock is for Linux only."
+[[ "$(uname -m)" == "x86_64" ]] || fail "This lock is for x86_64 only."
+[[ -f "${CONDA_LOCK}" ]] || fail "Missing conda lock: ${CONDA_LOCK}"
+[[ -f "${PIP_LOCK}" ]] || fail "Missing pip lock: ${PIP_LOCK}"
 
-# ---- NVIDIA GPU ----
-if ! command -v nvidia-smi >/dev/null 2>&1; then
-    echo "[ERROR] nvidia-smi not found."
-    exit 1
-fi
-
-echo "[GPU]"
-nvidia-smi --query-gpu=name,memory.total,driver_version \
-    --format=csv,noheader
-
-echo
-echo "[PCIe]"
-nvidia-smi -q | grep -A 12 "GPU Link Info" || true
-
-
-echo
-echo "============================================================"
-echo "[2/8] Initialize conda"
-echo "============================================================"
-
-# Allows 'conda activate' inside a shell script
-eval "$(conda shell.bash hook)"
-
-
-echo
-echo "============================================================"
-echo "[3/8] Create conda environment: ${ENV_NAME}"
-echo "============================================================"
-
-if conda env list | awk '{print $1}' | grep -qx "${ENV_NAME}"; then
-    echo "[INFO] Conda environment '${ENV_NAME}' already exists."
+# A non-interactive script does not source .bashrc, so initialize conda
+# explicitly rather than relying on the caller's interactive shell setup.
+if [[ -r "${CONDA_SH}" ]]; then
+    # shellcheck disable=SC1090
+    source "${CONDA_SH}"
+elif command -v conda >/dev/null 2>&1; then
+    eval "$(conda shell.bash hook)"
 else
-    conda create -n "${ENV_NAME}" \
-        python="${PYTHON_VERSION}" \
-        pip \
-        -y
+    fail "Conda is unavailable. Set CONDA_SH to its etc/profile.d/conda.sh path."
 fi
 
+command -v nvidia-smi >/dev/null 2>&1 || fail "nvidia-smi not found."
+echo "GPU: $(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader | head -n 1)"
+echo "Conda: $(conda --version)"
+
+if conda env list | awk -v env_name="${ENV_NAME}" '$1 == env_name { found = 1 } END { exit !found }'; then
+    if [[ "${RECREATE}" != "1" ]]; then
+        fail "Environment '${ENV_NAME}' already exists. Use a new ENV_NAME, or set RECREATE=1 to replace it."
+    fi
+    echo "Removing existing environment: ${ENV_NAME}"
+    conda env remove --name "${ENV_NAME}" --yes
+fi
+
+echo "Creating '${ENV_NAME}' from the exact conda package lock"
+conda create --name "${ENV_NAME}" --file "${CONDA_LOCK}" --yes
 conda activate "${ENV_NAME}"
 
-echo "[OK] Python: $(python --version)"
-echo "[OK] Python path: $(which python)"
+echo "Installing the exact pip package lock"
+python -m pip install --upgrade --force-reinstall --requirement "${PIP_LOCK}"
+python -m pip check
 
+echo "Verifying every locked pip package version"
+python - "${PIP_LOCK}" <<'PY'
+from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
+import sys
 
-echo
-echo "============================================================"
-echo "[4/8] Upgrade pip"
-echo "============================================================"
-
-python -m pip install --upgrade \
-    pip \
-    setuptools \
-    wheel
-
-
-echo
-echo "============================================================"
-echo "[5/8] Install PyTorch (CUDA 12.6)"
-echo "============================================================"
-
-python -m pip install \
-    torch \
-    torchvision \
-    torchaudio \
-    --index-url https://download.pytorch.org/whl/cu126
-
-
-echo
-echo "============================================================"
-echo "[6/8] Install Hugging Face / Mixtral dependencies"
-echo "============================================================"
-
-python -m pip install -U \
-    transformers \
-    accelerate \
-    datasets \
-    huggingface_hub \
-    safetensors \
-    sentencepiece \
-    protobuf
-
-
-echo
-echo "============================================================"
-echo "[7/8] Install profiling / experiment packages"
-echo "============================================================"
-
-python -m pip install -U \
-    numpy \
-    pandas \
-    psutil \
-    nvidia-ml-py \
-    tqdm
-
-
-echo
-echo "============================================================"
-echo "[8/8] Verify installation"
-echo "============================================================"
+for raw_line in Path(sys.argv[1]).read_text().splitlines():
+    line = raw_line.strip()
+    if not line or line.startswith("#") or line.startswith("--"):
+        continue
+    name, expected = line.split("==", 1)
+    try:
+        actual = version(name)
+    except PackageNotFoundError as exc:
+        raise SystemExit(f"missing locked package: {name}") from exc
+    if actual != expected:
+        raise SystemExit(f"version mismatch for {name}: expected {expected}, got {actual}")
+    print(f"[OK] {name}=={actual}")
+PY
 
 python - <<'PY'
 import sys
@@ -140,48 +82,17 @@ import torch
 import transformers
 import accelerate
 import datasets
-import huggingface_hub
-import numpy
-import pandas
-import psutil
-import pynvml
 
-print()
-print("=============== Environment ===============")
-print(f"Python            : {sys.version.split()[0]}")
-print(f"PyTorch           : {torch.__version__}")
-print(f"PyTorch CUDA      : {torch.version.cuda}")
-print(f"Transformers      : {transformers.__version__}")
-print(f"Accelerate        : {accelerate.__version__}")
-print(f"Datasets          : {datasets.__version__}")
-print(f"HuggingFace Hub   : {huggingface_hub.__version__}")
-print(f"NumPy             : {numpy.__version__}")
-print(f"Pandas            : {pandas.__version__}")
-print()
-
-print("=============== GPU ===============")
-print(f"CUDA available    : {torch.cuda.is_available()}")
-
+print("Python:", sys.version.split()[0])
+print("PyTorch:", torch.__version__, "CUDA:", torch.version.cuda)
+print("Transformers:", transformers.__version__)
+print("Accelerate:", accelerate.__version__)
+print("Datasets:", datasets.__version__)
 if not torch.cuda.is_available():
-    raise RuntimeError("CUDA is not available.")
-
-gpu = torch.cuda.get_device_properties(0)
-
-print(f"GPU               : {torch.cuda.get_device_name(0)}")
-print(f"VRAM              : {gpu.total_memory / 1024**3:.2f} GiB")
-print(f"Compute capability: {gpu.major}.{gpu.minor}")
-
-print()
-print("[SUCCESS] Mixtral profiling environment is ready.")
+    raise SystemExit("CUDA is not available in the recreated environment")
+print("GPU:", torch.cuda.get_device_name(0))
+print("[SUCCESS] Reproducible Mixtral environment is ready.")
 PY
 
-
 echo
-echo "============================================================"
-echo "Setup complete"
-echo "============================================================"
-echo
-echo "Activate later with:"
-echo
-echo "    conda activate ${ENV_NAME}"
-echo
+echo "Activate with: conda activate ${ENV_NAME}"
