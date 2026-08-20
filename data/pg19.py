@@ -18,6 +18,7 @@ DEFAULT_DATASET = "emozilla/pg19"
 class PG19Sample:
     sample_id: str
     input_ids: torch.Tensor
+    decode_tokens: int
 
 
 def _text_from_row(row: dict[str, object]) -> str:
@@ -33,20 +34,24 @@ def load_deterministic_pg19_samples(
     *,
     num_samples: int,
     sample_seed: int,
-    required_tokens: int,
+    prefill_tokens: int,
+    max_decode_tokens: int,
     dataset_name: str = DEFAULT_DATASET,
-    split: str = "train",
+    split: str = "test",
     max_scan: int = 1_024,
+    allow_shorter_decode: bool = True,
 ) -> list[PG19Sample]:
-    """Select seed-stable contiguous spans suitable for teacher-forced LM.
+    """Select seed-stable PG-19 spans suitable for teacher-forced LM.
 
-    The dataset is streamed, shuffled with the requested seed, and only enough
-    rows are inspected to find long documents. Each selected document gets a
-    deterministic in-document start offset, so repeated runs use identical
-    token IDs without downloading the complete corpus.
+    Documents are streamed and shuffled with the requested seed.  When
+    ``allow_shorter_decode`` is true, every document with a valid prefix is
+    retained and its continuation is capped by its remaining length. This lets
+    corpus PPL cover all 100 PG-19 test books without inventing padding or
+    crossing document boundaries. Long documents still receive exactly
+    ``max_decode_tokens`` scored tokens.
     """
-    if num_samples < 1 or required_tokens < 2 or max_scan < 1:
-        raise ValueError("num_samples, required_tokens, and max_scan must be positive")
+    if num_samples < 1 or prefill_tokens < 1 or max_decode_tokens < 1 or max_scan < 1:
+        raise ValueError("num_samples, prefill_tokens, max_decode_tokens, and max_scan must be positive")
     dataset = load_dataset(dataset_name, split=split, streaming=True).shuffle(
         seed=sample_seed,
         buffer_size=1_024,
@@ -57,20 +62,27 @@ def load_deterministic_pg19_samples(
             break
         text = _text_from_row(row)
         token_ids = tokenizer(text, add_special_tokens=False)["input_ids"]
-        if len(token_ids) < required_tokens:
+        minimum_tokens = prefill_tokens + 2  # prefix, one input, and one target
+        if len(token_ids) < minimum_tokens:
             continue
-        max_start = len(token_ids) - required_tokens
+        available_decode_tokens = len(token_ids) - prefill_tokens - 1
+        if not allow_shorter_decode and available_decode_tokens < max_decode_tokens:
+            continue
+        decode_tokens = min(max_decode_tokens, available_decode_tokens)
+        span_tokens = prefill_tokens + decode_tokens + 1
+        max_start = len(token_ids) - span_tokens
         start = random.Random(f"pg19:{sample_seed}:{row_index}").randint(0, max_start)
         sample_id = str(row.get("id", f"pg19-{row_index}"))
         selected.append(
             PG19Sample(
                 sample_id=f"{sample_id}@{start}",
-                input_ids=torch.tensor([token_ids[start : start + required_tokens]], dtype=torch.long),
+                input_ids=torch.tensor([token_ids[start : start + span_tokens]], dtype=torch.long),
+                decode_tokens=decode_tokens,
             )
         )
         if len(selected) == num_samples:
             return selected
     raise ValueError(
-        f"found only {len(selected)} PG-19 samples with at least {required_tokens} tokens "
-        f"after scanning {max_scan} streamed rows"
+        f"found only {len(selected)} PG-19 samples with at least {minimum_tokens} tokens after scanning {max_scan} "
+        f"streamed rows; requested {num_samples}"
     )

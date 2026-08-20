@@ -66,6 +66,17 @@ LAYER_FIELDS = (
     "hidden_rel_l2",
     "hidden_cosine_distance",
 )
+CORPUS_FIELDS = (
+    "quant_bits",
+    "completed_samples",
+    "scored_tokens",
+    "mean_fp_nll",
+    "fp_ppl",
+    "mean_q_nll",
+    "q_ppl",
+    "mean_delta_nll",
+    "ppl_ratio",
+)
 
 
 @dataclass(frozen=True)
@@ -419,6 +430,43 @@ def _write_summary(output_dir: Path) -> None:
     os.replace(temporary, path)
 
 
+def _write_corpus_summary(output_dir: Path) -> dict[str, object]:
+    """Aggregate token NLL before exponentiating, as required for corpus PPL."""
+    token_path = output_dir / "token_metrics.csv"
+    with token_path.open(newline="") as handle:
+        values = list(csv.DictReader(handle))
+    if not values:
+        raise ValueError("cannot calculate corpus PPL from an empty token_metrics.csv")
+    quant_bits = {row["quant_bits"] for row in values}
+    if len(quant_bits) != 1:
+        raise ValueError(f"corpus summary expects one quantization setting, got {sorted(quant_bits)}")
+    sample_ids = {row["sample_id"] for row in values}
+    mean_fp_nll = sum(float(row["fp_nll"]) for row in values) / len(values)
+    mean_q_nll = sum(float(row["q_nll"]) for row in values) / len(values)
+    mean_delta_nll = mean_q_nll - mean_fp_nll
+    row: dict[str, object] = {
+        "quant_bits": quant_bits.pop(),
+        "completed_samples": len(sample_ids),
+        "scored_tokens": len(values),
+        "mean_fp_nll": mean_fp_nll,
+        "fp_ppl": math.exp(mean_fp_nll),
+        "mean_q_nll": mean_q_nll,
+        "q_ppl": math.exp(mean_q_nll),
+        "mean_delta_nll": mean_delta_nll,
+        "ppl_ratio": math.exp(mean_delta_nll),
+    }
+    path = output_dir / "corpus_summary.csv"
+    temporary = path.with_suffix(".csv.tmp")
+    with temporary.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=CORPUS_FIELDS)
+        writer.writeheader()
+        writer.writerow(row)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+    return row
+
+
 class QualityRuntime:
     def __init__(self, model_path: str, cache_slots: int) -> None:
         if cache_slots < HostExpertStore.NUM_LAYERS:
@@ -633,15 +681,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--quant-row-chunk-size", type=int, default=128)
     parser.add_argument("--prefill-tokens", type=int, default=512)
     parser.add_argument("--decode-tokens", type=int, default=8192)
-    parser.add_argument("--num-samples", type=int, default=3)
+    parser.add_argument("--num-samples", type=int, default=100)
     parser.add_argument("--sample-seed", type=int, default=42)
     parser.add_argument("--hidden-stride", type=int, default=32)
     parser.add_argument("--sanity-tokens", type=int, default=16)
     parser.add_argument("--cache-slots", type=int, default=48)
     parser.add_argument("--cpu-threads", type=int, default=8)
     parser.add_argument("--dataset", default=DEFAULT_DATASET)
-    parser.add_argument("--dataset-split", default="train")
+    parser.add_argument("--dataset-split", default="test")
     parser.add_argument("--dataset-max-scan", type=int, default=1024)
+    parser.add_argument(
+        "--require-full-decode",
+        action="store_true",
+        help="Skip documents that cannot supply the requested --decode-tokens (instead of scoring their shorter suffix).",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     return parser.parse_args()
 
@@ -664,6 +717,7 @@ RESUME_FIELDS = (
     "sample_seed",
     "hidden_stride",
     "cache_slots",
+    "require_full_decode",
 )
 
 
@@ -679,12 +733,13 @@ def experiment_config(args: argparse.Namespace) -> dict[str, object]:
         "sample_seed": args.sample_seed,
         "hidden_stride": args.hidden_stride,
         "cache_slots": args.cache_slots,
+        "require_full_decode": args.require_full_decode,
     }
 
 
 def validate_resume_metadata(metadata: dict[str, Any], args: argparse.Namespace) -> None:
     expected = experiment_config(args)
-    if metadata.get("quality_drift_version") != 2:
+    if metadata.get("quality_drift_version") != 3:
         raise ValueError(
             "output directory contains results from an older/incompatible quality benchmark; "
             "choose a new --output-dir"
@@ -732,7 +787,7 @@ def main() -> None:
         validate_resume_metadata(metadata, args)
     else:
         metadata = {
-            "quality_drift_version": 2,
+            "quality_drift_version": 3,
             "git_commit": _git_commit(),
             "torch_version": torch.__version__,
             "transformers_version": transformers.__version__,
@@ -749,17 +804,24 @@ def main() -> None:
         tokenizer,
         num_samples=args.num_samples,
         sample_seed=args.sample_seed,
-        required_tokens=args.prefill_tokens + args.decode_tokens + 1,
+        prefill_tokens=args.prefill_tokens,
+        max_decode_tokens=args.decode_tokens,
         dataset_name=args.dataset,
         split=args.dataset_split,
         max_scan=args.dataset_max_scan,
+        allow_shorter_decode=not args.require_full_decode,
     )
     sample_ids = [sample.sample_id for sample in samples]
     existing_sample_ids = metadata.get("sample_ids")
     if existing_sample_ids is not None and existing_sample_ids != sample_ids:
         raise ValueError("deterministic sample selection differs from existing output metadata")
     metadata["sample_ids"] = sample_ids
+    decode_lengths = [sample.decode_tokens for sample in samples]
     print(f"PG-19 samples (seed={args.sample_seed}): {metadata['sample_ids']}")
+    print(
+        f"Continuation tokens/sample: min={min(decode_lengths)}, max={max(decode_lengths)}, "
+        f"total={sum(decode_lengths)}"
+    )
 
     runtime = QualityRuntime(args.model, args.cache_slots)
     try:
@@ -784,7 +846,7 @@ def main() -> None:
             print(f"BF16 KV replay sanity: PASS ({args.sanity_tokens} teacher-forced tokens)")
 
             fp_trace = runtime.collect_fp_trace(
-                sequence, snapshot, args.prefill_tokens, args.decode_tokens, args.hidden_stride
+                sequence, snapshot, args.prefill_tokens, sample.decode_tokens, args.hidden_stride
             )
             fp_path = checkpoints / f"sample_{sample_index:04d}_bf16.pt"
             save_fp_checkpoint(fp_path, snapshot, fp_trace)
@@ -794,6 +856,7 @@ def main() -> None:
                     "sample_index": sample_index,
                     "fp_checkpoint": str(fp_path.relative_to(args.output_dir)),
                     "prefill_kv_length": args.prefill_tokens,
+                    "decode_tokens": sample.decode_tokens,
                 }
             )
             bf16_ids.add(sample.sample_id)
@@ -831,8 +894,8 @@ def main() -> None:
                 continue
             fp_record = next(row for row in bf16_completed if row["sample_id"] == sample.sample_id)
             snapshot_cpu, fp_trace = load_fp_checkpoint(args.output_dir / fp_record["fp_checkpoint"])
-            if len(fp_trace) != args.decode_tokens:
-                raise AssertionError("FP checkpoint decode length differs from current experiment")
+            if len(fp_trace) != sample.decode_tokens:
+                raise AssertionError("FP checkpoint decode length differs from the selected PG-19 sample")
             token_path = checkpoints / f"sample_{sample_index:04d}_tokens.csv"
             layer_path = checkpoints / f"sample_{sample_index:04d}_layers.csv"
             token_writer = SampleCSVWriter(token_path, TOKEN_FIELDS)
@@ -878,9 +941,15 @@ def main() -> None:
                 LAYER_FIELDS,
             )
             _write_summary(args.output_dir)
+            corpus = _write_corpus_summary(args.output_dir)
             metadata["quantized_completed_samples"] = quantized_completed
+            metadata["corpus_summary"] = corpus
             _atomic_json(metadata_path, metadata)
-            print(f"Checkpointed quantized phase for {sample.sample_id}")
+            print(
+                f"Checkpointed quantized phase for {sample.sample_id}; "
+                f"corpus continuation PPL: FP={corpus['fp_ppl']:.4f}, "
+                f"W{args.quant_bits}A16={corpus['q_ppl']:.4f}, ratio={corpus['ppl_ratio']:.4f}"
+            )
             del snapshot_cpu, fp_trace
     finally:
         runtime.hooks.close()
