@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +18,17 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from surrogate.tiny_swiglu import HIDDEN_SIZE, TinySwiGLUSurrogate
-from surrogate.train_per_expert_linear import NUM_EXPERTS, compute_mse, load_trace, set_deterministic_seed, trace_tensors
+from surrogate.train_per_expert_linear import NUM_EXPERTS, load_trace, set_deterministic_seed, trace_tensors
+
+
+@dataclass
+class GPUTrace:
+    """One expert's FP32 train and validation trace retained on CUDA."""
+
+    train_inputs: torch.Tensor
+    train_targets: torch.Tensor
+    validation_inputs: torch.Tensor
+    validation_targets: torch.Tensor
 
 
 def parse_args() -> argparse.Namespace:
@@ -26,7 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trace-dir", type=Path, default=Path("results/surrogate_per_expert/layer_16"))
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--hidden-sizes", type=int, nargs="+", default=[64, 128, 256, 512, 1024])
-    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--max-epochs", type=int, default=50)
     parser.add_argument("--early-stopping-patience", type=int, default=5)
@@ -53,6 +64,33 @@ def validate_args(args: argparse.Namespace) -> None:
 def checkpoint_path(output_dir: Path, intermediate_size: int, expert_id: int) -> Path:
     """Return the capacity-specific checkpoint path."""
     return output_dir / f"hidden_{intermediate_size}" / f"expert_{expert_id}.pt"
+
+
+def prepare_gpu_trace(
+    train_trace: dict[str, object],
+    validation_trace: dict[str, object],
+) -> GPUTrace:
+    """Upload one expert's BF16 CPU trace once and retain FP32 tensors on CUDA."""
+    train_inputs, train_targets = trace_tensors(train_trace)
+    validation_inputs, validation_targets = trace_tensors(validation_trace)
+    return GPUTrace(
+        train_inputs=train_inputs.to("cuda", dtype=torch.float32),
+        train_targets=train_targets.to("cuda", dtype=torch.float32),
+        validation_inputs=validation_inputs.to("cuda", dtype=torch.float32),
+        validation_targets=validation_targets.to("cuda", dtype=torch.float32),
+    )
+
+
+@torch.no_grad()
+def compute_validation_mse(model: nn.Module, trace: GPUTrace, batch_size: int) -> float:
+    """Calculate validation MSE with one host synchronization after all batches."""
+    squared_error_sum = torch.zeros((), device="cuda", dtype=torch.float32)
+    for start_index in range(0, trace.validation_inputs.shape[0], batch_size):
+        batch_inputs = trace.validation_inputs[start_index : start_index + batch_size]
+        batch_targets = trace.validation_targets[start_index : start_index + batch_size]
+        squared_error_sum.add_((model(batch_inputs) - batch_targets).square().sum())
+    validation_elements = trace.validation_targets.numel()
+    return float((squared_error_sum / validation_elements).item())
 
 
 def save_checkpoint(
@@ -96,20 +134,17 @@ def finalize_checkpoint(path: Path, epochs_run: int, early_stopped: bool) -> Non
 
 def train_one_configuration(
     args: argparse.Namespace,
-    train_trace: dict[str, object],
-    validation_trace: dict[str, object],
+    gpu_trace: GPUTrace,
     expert_id: int,
     intermediate_size: int,
     output_dir: Path,
 ) -> dict[str, Any]:
     """Train one expert-capacity pair with validation early stopping."""
-    train_inputs, train_targets = trace_tensors(train_trace)
-    validation_inputs, _ = trace_tensors(validation_trace)
     configuration_seed = args.seed + expert_id * 10_000 + intermediate_size
     set_deterministic_seed(configuration_seed)
     model = TinySwiGLUSurrogate(intermediate_size).to("cuda", dtype=torch.float32)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=0.0)
-    sample_generator = torch.Generator(device="cpu").manual_seed(configuration_seed)
+    sample_generator = torch.Generator(device="cuda").manual_seed(configuration_seed)
     best_validation_mse = float("inf")
     best_epoch = 0
     epochs_without_improvement = 0
@@ -119,19 +154,26 @@ def train_one_configuration(
 
     for epoch in range(1, args.max_epochs + 1):
         model.train()
-        sample_order = torch.randperm(train_inputs.shape[0], generator=sample_generator)
+        sample_order = torch.randperm(
+            gpu_trace.train_inputs.shape[0],
+            generator=sample_generator,
+            device="cuda",
+        )
+        training_squared_error = torch.zeros((), device="cuda", dtype=torch.float32)
         for start_index in range(0, sample_order.numel(), args.batch_size):
             batch_indices = sample_order[start_index : start_index + args.batch_size]
-            batch_inputs = train_inputs[batch_indices].to("cuda", dtype=torch.float32)
-            batch_targets = train_targets[batch_indices].to("cuda", dtype=torch.float32)
+            batch_inputs = gpu_trace.train_inputs[batch_indices]
+            batch_targets = gpu_trace.train_targets[batch_indices]
             optimizer.zero_grad(set_to_none=True)
-            loss = torch.mean((model(batch_inputs) - batch_targets).square())
+            prediction_error = model(batch_inputs) - batch_targets
+            loss = torch.mean(prediction_error.square())
             loss.backward()
             optimizer.step()
+            training_squared_error.add_(prediction_error.detach().square().sum())
 
         model.eval()
-        train_mse = compute_mse(model, train_trace, args.batch_size)
-        validation_mse = compute_mse(model, validation_trace, args.batch_size)
+        train_mse = float((training_squared_error / gpu_trace.train_targets.numel()).item())
+        validation_mse = compute_validation_mse(model, gpu_trace, args.batch_size)
         epochs_run = epoch
         if validation_mse < best_validation_mse - args.min_delta:
             best_validation_mse = validation_mse
@@ -145,8 +187,8 @@ def train_one_configuration(
                 best_epoch,
                 best_validation_mse,
                 epochs_run,
-                int(train_inputs.shape[0]),
-                int(validation_inputs.shape[0]),
+                int(gpu_trace.train_inputs.shape[0]),
+                int(gpu_trace.validation_inputs.shape[0]),
             )
         else:
             epochs_without_improvement += 1
@@ -166,6 +208,7 @@ def train_one_configuration(
         epochs_run,
         early_stopped,
     )
+    del model, optimizer
 
     return {
         "expert_id": expert_id,
@@ -175,8 +218,8 @@ def train_one_configuration(
         "best_val_mse": best_validation_mse,
         "epochs_run": epochs_run,
         "early_stopped": early_stopped,
-        "train_samples": int(train_inputs.shape[0]),
-        "val_samples": int(validation_inputs.shape[0]),
+        "train_samples": int(gpu_trace.train_inputs.shape[0]),
+        "val_samples": int(gpu_trace.validation_inputs.shape[0]),
         "history": history,
     }
 
@@ -204,18 +247,22 @@ def main() -> None:
     for expert_id in args.experts:
         train_trace = load_trace(args.trace_dir / "train" / f"expert_{expert_id}.pt")
         validation_trace = load_trace(args.trace_dir / "val" / f"expert_{expert_id}.pt")
-        for intermediate_size in args.hidden_sizes:
-            print(f"Training E{expert_id} Tiny SwiGLU-{intermediate_size}")
-            summary["configurations"].append(
-                train_one_configuration(
-                    args,
-                    train_trace,
-                    validation_trace,
-                    expert_id,
-                    intermediate_size,
-                    output_dir,
+        gpu_trace = prepare_gpu_trace(train_trace, validation_trace)
+        try:
+            for intermediate_size in args.hidden_sizes:
+                print(f"Training E{expert_id} Tiny SwiGLU-{intermediate_size}")
+                summary["configurations"].append(
+                    train_one_configuration(
+                        args,
+                        gpu_trace,
+                        expert_id,
+                        intermediate_size,
+                        output_dir,
+                    )
                 )
-            )
+        finally:
+            del gpu_trace
+            torch.cuda.empty_cache()
     (output_dir / "training_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     print(f"Saved Tiny SwiGLU checkpoints to: {output_dir}")
 
