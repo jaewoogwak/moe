@@ -36,7 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--trace-dir", type=Path, default=Path("results/surrogate_per_expert/layer_16"))
     parser.add_argument("--output-dir", type=Path)
-    parser.add_argument("--hidden-sizes", type=int, nargs="+", default=[64, 128, 256, 512, 1024])
+    parser.add_argument("--hidden-sizes", type=int, nargs="+", default=[64, 128, 256, 512, 1024, 4096])
     parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--max-epochs", type=int, default=50)

@@ -34,7 +34,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-dir", type=Path)
     parser.add_argument("--linear-checkpoint-dir", type=Path)
     parser.add_argument("--output-dir", type=Path)
-    parser.add_argument("--hidden-sizes", type=int, nargs="+", default=[64, 128, 256, 512, 1024])
+    parser.add_argument("--hidden-sizes", type=int, nargs="+", default=[64, 128, 256, 512, 1024, 4096])
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--experts", type=int, nargs="+", default=list(range(NUM_EXPERTS)))
     return parser.parse_args()
