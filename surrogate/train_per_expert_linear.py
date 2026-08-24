@@ -190,9 +190,9 @@ def train_one_expert(args: argparse.Namespace, expert_id: int, checkpoint_dir: P
             }
         )
         print(f"E{expert_id} epoch {epoch}/{args.max_epochs}:")
-        print(f"  train_mse={train_mse:.6e}")
-        print(f"  val_mse={validation_mse:.6e}")
-        print(f"  best_val_mse={best_validation_mse:.6e}")
+        print(f"  train_mse={train_mse:.8f}")
+        print(f"  val_mse={validation_mse:.8f}")
+        print(f"  best_val_mse={best_validation_mse:.8f}")
         print(f"  patience={epochs_without_improvement}/{args.early_stopping_patience}")
         if epochs_without_improvement >= args.early_stopping_patience:
             early_stopped = True
