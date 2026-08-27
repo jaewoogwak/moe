@@ -57,7 +57,10 @@ def main():
  for h in hs:h.remove()
  state={}; meta={'model':model_id,'method':'submoe','calibration_dataset':a.calib_dataset,'num_blocks':a.num_blocks,'block_size':a.block_size,'num_groups':groups,'seed':a.seed,'max_iter':a.max_iter,'similarity':'mean_tokenwise_cosine','initialization':'kmeans++','convergence_iterations':{},'empty_cluster_events':{}}
  for i,l in enumerate(layers):
-  x=torch.cat(inputs.pop(i)); experts=l.mlp.experts; outputs=[]; num_experts=model.config.num_local_experts if a.model_type=='mixtral' else len(experts)
+  x=torch.cat(inputs.pop(i),dim=0)
+  x=x.reshape(-1,x.shape[-1])
+  assert x.shape == (a.num_blocks*a.block_size,x.shape[-1]), f'Unexpected flattened calibration shape: {tuple(x.shape)}'
+  experts=l.mlp.experts; outputs=[]; num_experts=model.config.num_local_experts if a.model_type=='mixtral' else len(experts)
   print(f'L{i:02d} Sub-MoE outputs CPU BF16: {num_experts * x.shape[0] * x.shape[1] * 2 / 1024**3:.2f} GiB')
   for e in range(num_experts):
    chunks=[]
@@ -69,7 +72,9 @@ def main():
       expert=experts[e]; y=expert(x[s:s+a.chunk_size].to(execution_device(expert)))
      chunks.append(y.detach().cpu().to(torch.bfloat16))
    outputs.append(torch.cat(chunks)); del chunks
-  result=cluster_expert_outputs(torch.stack(outputs),groups,seed=a.seed,max_iter=a.max_iter,chunk_size=a.chunk_size); key=f'model.layers.{i}.mlp'; state[key]=result.labels; meta['convergence_iterations'][str(i)]=result.iterations; meta['empty_cluster_events'][str(i)]=result.empty_cluster_events
+  expert_outputs=torch.stack(outputs)
+  assert expert_outputs.shape == (num_experts,x.shape[0],x.shape[1]), f'Unexpected expert output shape: {tuple(expert_outputs.shape)}'
+  result=cluster_expert_outputs(expert_outputs,groups,seed=a.seed,max_iter=a.max_iter,chunk_size=a.chunk_size); key=f'model.layers.{i}.mlp'; state[key]=result.labels; meta['convergence_iterations'][str(i)]=result.iterations; meta['empty_cluster_events'][str(i)]=result.empty_cluster_events
   members={g:torch.where(result.labels==g)[0].tolist() for g in range(groups)}; print(f'L{i:02d} '+ ' '.join(f'G{g}:{m}' for g,m in members.items())); del x,outputs; gc.collect(); torch.cuda.empty_cache()
  a.output_dir.mkdir(parents=True,exist_ok=True); torch.save(state,a.output_dir/'group_state_dict.pt'); (a.output_dir/'group_mapping_metadata.json').write_text(json.dumps(meta,indent=2)+'\n')
 if __name__=='__main__':main()
