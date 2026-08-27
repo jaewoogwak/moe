@@ -32,6 +32,12 @@ def execution_device(module):
  hook=getattr(module,'_hf_hook',None); d=getattr(hook,'execution_device',None)
  if d is not None:return torch.device(d)
  return next(p for p in module.parameters() if p.device.type!='meta').device
+def qwen_expert_weight(experts,name,index):
+ weight=getattr(experts,name)
+ if weight.device.type!='meta': return weight[index]
+ weight_map=getattr(getattr(experts,'_hf_hook',None),'weights_map',None)
+ if weight_map is None: raise RuntimeError(f'Cannot access CPU-offloaded Qwen expert weight {name}')
+ return weight_map[name][index]
 def load_mixtral(model_id):
  model=AutoModelForCausalLM.from_pretrained(model_id,dtype=torch.bfloat16,device_map='cpu',low_cpu_mem_usage=True); model.eval()
  store=HostExpertStore(model)
@@ -60,16 +66,19 @@ def main():
   x=torch.cat(inputs.pop(i),dim=0)
   x=x.reshape(-1,x.shape[-1])
   assert x.shape == (a.num_blocks*a.block_size,x.shape[-1]), f'Unexpected flattened calibration shape: {tuple(x.shape)}'
-  experts=l.mlp.experts; outputs=[]; num_experts=model.config.num_local_experts if a.model_type=='mixtral' else len(experts)
+  experts=l.mlp.experts; outputs=[]; num_experts=model.config.num_local_experts if a.model_type=='mixtral' else model.config.num_experts
   print(f'L{i:02d} Sub-MoE outputs CPU BF16: {num_experts * x.shape[0] * x.shape[1] * 2 / 1024**3:.2f} GiB')
   for e in range(num_experts):
    chunks=[]
+   if a.model_type=='qwen':
+    gate_up=qwen_expert_weight(experts,'gate_up_proj',e).to('cuda',dtype=torch.bfloat16,non_blocking=True)
+    down=qwen_expert_weight(experts,'down_proj',e).to('cuda',dtype=torch.bfloat16,non_blocking=True)
    for s in range(0,len(x),a.chunk_size):
     with torch.inference_mode():
      if a.model_type=='mixtral':
       gate_up,down=cache.get(i,e); gate,up=F.linear(x[s:s+a.chunk_size].cuda(),gate_up).chunk(2,-1); y=F.linear(F.silu(gate)*up,down)
      else:
-      expert=experts[e]; y=expert(x[s:s+a.chunk_size].to(execution_device(expert)))
+      gate,up=F.linear(x[s:s+a.chunk_size].cuda(),gate_up).chunk(2,-1); y=F.linear(F.silu(gate)*up,down)
      chunks.append(y.detach().cpu().to(torch.bfloat16))
    outputs.append(torch.cat(chunks)); del chunks
   expert_outputs=torch.stack(outputs)
