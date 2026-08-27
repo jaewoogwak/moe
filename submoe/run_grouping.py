@@ -46,6 +46,7 @@ def main():
  if a.model_type=='mixtral': model,store,cache=load_mixtral(model_id)
  else: model=AutoModelForCausalLM.from_pretrained(model_id,dtype=torch.bfloat16,device_map='auto',max_memory={0:a.gpu_memory,'cpu':'900GiB'},low_cpu_mem_usage=True); model.eval()
  layers=model.model.layers; inputs=defaultdict(list)
+ if a.model_type=='qwen': print(f'Qwen sanity: routed experts={model.config.num_experts}, shared experts={int(hasattr(layers[0].mlp,"shared_expert"))}, target groups={groups}')
  hs=[]
  for i,l in enumerate(layers): hs.append(l.mlp.register_forward_pre_hook(lambda _,x,i=i: inputs[i].append(x[0].detach().cpu().to(torch.bfloat16))))
  for ids in blocks(tok,a):
@@ -57,6 +58,7 @@ def main():
  state={}; meta={'model':model_id,'method':'submoe','calibration_dataset':a.calib_dataset,'num_blocks':a.num_blocks,'block_size':a.block_size,'num_groups':groups,'seed':a.seed,'max_iter':a.max_iter,'similarity':'mean_tokenwise_cosine','initialization':'kmeans++','convergence_iterations':{},'empty_cluster_events':{}}
  for i,l in enumerate(layers):
   x=torch.cat(inputs.pop(i)); experts=l.mlp.experts; outputs=[]; num_experts=model.config.num_local_experts if a.model_type=='mixtral' else len(experts)
+  print(f'L{i:02d} Sub-MoE outputs CPU BF16: {num_experts * x.shape[0] * x.shape[1] * 2 / 1024**3:.2f} GiB')
   for e in range(num_experts):
    chunks=[]
    for s in range(0,len(x),a.chunk_size):
